@@ -1829,7 +1829,7 @@ mod tests {
 
     // Compile-time layout check: UserMsgHdr must match Linux's struct user_msghdr.
     const _USER_MSG_HDR_SIZE: () = assert!(
-        core::mem::size_of::<litebox_common_linux::UserMsgHdr<P>>()
+        core::mem::size_of::<litebox_common_linux::UserMsgHdr<crate::syscalls::tests::Platform>>()
             == core::mem::size_of::<libc::msghdr>()
     );
 
@@ -1839,20 +1839,20 @@ mod tests {
     const SERVER_PORT: u16 = 8080;
     const CLIENT_PORT: u16 = 8081;
 
-    fn close_socket(task: &crate::Task<crate::DefaultFS>, fd: u32) {
+    fn close_socket(task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
     }
 
     /// Helper to read SO_ERROR from a socket via getsockopt.
     /// Returns the errno integer value (0 means no error).
-    fn get_so_error(task: &crate::Task<crate::DefaultFS>, sockfd: u32) -> u32 {
+    fn get_so_error(task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, sockfd: u32) -> u32 {
         let mut optval: u32 = 0xDEAD;
         let len = task
             .do_getsockopt(
                 sockfd,
                 SocketOptionName::Socket(SocketOption::ERROR),
-                MutPtr::<P, _>::from_usize((&raw mut optval).cast::<u8>() as usize),
+                MutPtr::<crate::syscalls::tests::Platform, _>::from_usize((&raw mut optval).cast::<u8>() as usize),
                 core::mem::size_of::<u32>().truncate(),
             )
             .expect("getsockopt SO_ERROR failed");
@@ -1861,7 +1861,7 @@ mod tests {
     }
 
     fn epoll_add(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         epfd: i32,
         target_fd: u32,
         events: litebox::event::Events,
@@ -1871,7 +1871,7 @@ mod tests {
             data: u64::from(target_fd),
         };
         let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
-        let ev_const = crate::ConstPtr::<P, _>::from_usize(ev_ptr as usize);
+        let ev_const = crate::ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(ev_ptr as usize);
         task.sys_epoll_ctl(
             epfd,
             litebox_common_linux::EpollOp::EpollCtlAdd,
@@ -1882,17 +1882,17 @@ mod tests {
     }
 
     fn epoll_wait(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         epfd: i32,
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
-        let events_ptr = crate::MutPtr::<P, _>::from_usize(events.as_mut_ptr() as usize);
+        let events_ptr = crate::MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(events.as_mut_ptr() as usize);
         task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
             .expect("epoll_wait failed")
     }
 
     fn test_tcp_socket_as_server(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         ip: [u8; 4],
         port: u16,
         is_nonblocking: bool,
@@ -2001,17 +2001,17 @@ mod tests {
                 let buf2 = " world!\n";
                 let iovec = [
                     litebox_common_linux::IoVec {
-                        iov_base: MutPtr::<P, _>::from_usize(buf1.as_ptr().expose_provenance()),
+                        iov_base: MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(buf1.as_ptr().expose_provenance()),
                         iov_len: buf1.len(),
                     },
                     litebox_common_linux::IoVec {
-                        iov_base: MutPtr::<P, _>::from_usize(buf2.as_ptr().expose_provenance()),
+                        iov_base: MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(buf2.as_ptr().expose_provenance()),
                         iov_len: buf2.len(),
                     },
                 ];
                 let hdr = {
-                    let mut h = litebox_common_linux::UserMsgHdr::<P>::new_zeroed();
-                    h.msg_iov = ConstPtr::<P, _>::from_usize(iovec.as_ptr() as usize);
+                    let mut h = litebox_common_linux::UserMsgHdr::<crate::syscalls::tests::Platform>::new_zeroed();
+                    h.msg_iov = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(iovec.as_ptr() as usize);
                     h.msg_iovlen = iovec.len();
                     h
                 };
@@ -2050,14 +2050,14 @@ mod tests {
                         .expect("Failed to receive data"),
                     "recvmsg" => {
                         let iovec = [litebox_common_linux::IoVec {
-                            iov_base: MutPtr::<P, _>::from_usize(recv_buf.as_mut_ptr().expose_provenance()),
+                            iov_base: MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(recv_buf.as_mut_ptr().expose_provenance()),
                             iov_len: recv_buf.len(),
                         }];
                         let mut msg_hdr =
-                            litebox_common_linux::UserMsgHdr::<P>::new_zeroed();
-                        msg_hdr.msg_iov = ConstPtr::<P, _>::from_usize(iovec.as_ptr() as usize);
+                            litebox_common_linux::UserMsgHdr::<crate::syscalls::tests::Platform>::new_zeroed();
+                        msg_hdr.msg_iov = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(iovec.as_ptr() as usize);
                         msg_hdr.msg_iovlen = iovec.len();
-                        let msg_ptr = MutPtr::<P, _>::from_usize(&raw mut msg_hdr as usize);
+                        let msg_ptr = MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(&raw mut msg_hdr as usize);
                         task.sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
                             .expect("failed to recvmsg")
                     }
@@ -2216,7 +2216,7 @@ mod tests {
             onoff: 1,   // enable linger
             linger: 60, // timeout in seconds
         };
-        let optval = ConstPtr::<P, _>::from_usize((&raw const linger).cast::<u8>() as usize);
+        let optval = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize((&raw const linger).cast::<u8>() as usize);
         task.do_setsockopt(
             client_fd,
             SocketOptionName::Socket(SocketOption::LINGER),
@@ -2236,7 +2236,7 @@ mod tests {
     }
 
     fn blocking_udp_server_socket(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         test_trunc: bool,
         set_trunc_flag: bool,
         is_nonblocking: bool,
@@ -2325,25 +2325,25 @@ mod tests {
                 let mut addrlen = core::mem::size_of::<CSockInetAddr>();
                 task.sys_recvfrom(
                     i32::try_from(server_fd).unwrap(),
-                    MutPtr::<P, _>::from_usize(recv_buf.as_mut_ptr() as usize),
+                    MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(recv_buf.as_mut_ptr() as usize),
                     recv_len,
                     recv_flags,
-                    Some(MutPtr::<P, _>::from_usize(source_addr.as_ptr() as usize)),
-                    MutPtr::<P, _>::from_usize(&raw mut addrlen as usize),
+                    Some(MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(source_addr.as_ptr() as usize)),
+                    MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(&raw mut addrlen as usize),
                 )
                 .expect("recvfrom failed")
             }
             "recvmsg" => {
                 let iovec = [litebox_common_linux::IoVec {
-                    iov_base: MutPtr::<P, _>::from_usize(recv_buf.as_mut_ptr() as usize),
+                    iov_base: MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(recv_buf.as_mut_ptr() as usize),
                     iov_len: recv_len,
                 }];
-                let mut msg_hdr = litebox_common_linux::UserMsgHdr::<P>::new_zeroed();
-                msg_hdr.msg_iov = ConstPtr::<P, _>::from_usize(iovec.as_ptr() as usize);
+                let mut msg_hdr = litebox_common_linux::UserMsgHdr::<crate::syscalls::tests::Platform>::new_zeroed();
+                msg_hdr.msg_iov = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(iovec.as_ptr() as usize);
                 msg_hdr.msg_iovlen = iovec.len();
-                msg_hdr.msg_name = MutPtr::<P, _>::from_usize(source_addr.as_ptr() as usize);
+                msg_hdr.msg_name = MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(source_addr.as_ptr() as usize);
                 msg_hdr.msg_namelen = source_addr.len().truncate();
-                let msg_ptr = MutPtr::<P, _>::from_usize(&raw mut msg_hdr as usize);
+                let msg_ptr = MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(&raw mut msg_hdr as usize);
                 let n = task
                     .sys_recvmsg(i32::try_from(server_fd).unwrap(), msg_ptr, recv_flags)
                     .expect("recvmsg failed");
@@ -2355,8 +2355,8 @@ mod tests {
             }
             _ => panic!("Unknown operation"),
         };
-        let sender_addr = read_sockaddr_from_user::<P>(
-            ConstPtr::<P, _>::from_usize(source_addr.as_ptr() as usize),
+        let sender_addr = read_sockaddr_from_user::<crate::syscalls::tests::Platform>(
+            ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(source_addr.as_ptr() as usize),
             source_addr.len(),
         )
         .ok();
@@ -2467,7 +2467,7 @@ mod tests {
             .do_getsockopt(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
-                MutPtr::<P, _>::from_usize(congestion_name.as_mut_ptr() as usize),
+                MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(congestion_name.as_mut_ptr() as usize),
                 congestion_name.len().truncate(),
             )
             .expect("Failed to get TCP_CONGESTION");
@@ -2480,7 +2480,7 @@ mod tests {
         task.do_setsockopt(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
-            ConstPtr::<P, _>::from_usize(congestion_name.as_ptr() as usize),
+            ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(congestion_name.as_ptr() as usize),
             optlen,
         )
         .expect("Failed to set TCP_CONGESTION");
@@ -2490,14 +2490,14 @@ mod tests {
             .do_setsockopt(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
-                ConstPtr::<P, _>::from_usize(congestion_name.as_ptr() as usize),
+                ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(congestion_name.as_ptr() as usize),
                 congestion_name.len(),
             )
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
 
         let val: u32 = 1;
-        let optval = ConstPtr::<P, _>::from_usize((&raw const val).cast::<u8>() as usize);
+        let optval = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize((&raw const val).cast::<u8>() as usize);
         task.do_setsockopt(
             sockfd,
             SocketOptionName::Socket(SocketOption::KEEPALIVE),
@@ -2508,7 +2508,7 @@ mod tests {
 
         // Verify SO_KEEPALIVE is enabled
         let mut result: u32 = 0;
-        let optval_out = MutPtr::<P, _>::from_usize((&raw mut result).cast::<u8>() as usize);
+        let optval_out = MutPtr::<crate::syscalls::tests::Platform, _>::from_usize((&raw mut result).cast::<u8>() as usize);
         let len = task
             .do_getsockopt(
                 sockfd,
@@ -2586,12 +2586,12 @@ mod unix_tests {
 
     extern crate std;
 
-    fn create_unix_socket(task: &Task<crate::DefaultFS>, ty: SockType, flags: SockFlags) -> u32 {
+    fn create_unix_socket(task: &Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, ty: SockType, flags: SockFlags) -> u32 {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
     }
 
     fn create_unix_server_socket(
-        task: &Task<crate::DefaultFS>,
+        task: &Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         addr: &str,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
@@ -2604,12 +2604,12 @@ mod unix_tests {
         Ok(server_fd)
     }
 
-    fn close_socket(task: &crate::Task<crate::DefaultFS>, fd: u32) {
+    fn close_socket(task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
     }
 
-    fn ppoll(task: &Task<crate::DefaultFS>, fd: u32, events: Events) {
+    fn ppoll(task: &Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, fd: u32, events: Events) {
         let fd = i32::try_from(fd).unwrap();
         let mut pollfd = [litebox_common_linux::Pollfd {
             fd,
@@ -2619,7 +2619,7 @@ mod unix_tests {
 
         let n = task
             .sys_ppoll(
-                MutPtr::<P, _>::from_usize(pollfd.as_mut_ptr() as usize),
+                MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(pollfd.as_mut_ptr() as usize),
                 1,
                 TimeParam::None,
                 None,
@@ -2989,7 +2989,7 @@ mod unix_tests {
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
         let task = init_platform(None);
         let mut sv_ptr = alloc::vec![0u32; 2];
-        let sv_mut_ptr = MutPtr::<P, _>::from_usize(sv_ptr.as_mut_ptr() as usize);
+        let sv_mut_ptr = MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(sv_ptr.as_mut_ptr() as usize);
 
         let ty_and_flags = if is_nonblocking {
             SockFlags::NONBLOCK.bits()
@@ -3059,7 +3059,7 @@ mod unix_tests {
             .expect("socketpair failed");
         let timeout = Duration::from_millis(200);
         let tv = litebox_common_linux::TimeVal::from(timeout);
-        let optval = ConstPtr::<P, _>::from_usize((&raw const tv).cast::<u8>() as usize);
+        let optval = ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize((&raw const tv).cast::<u8>() as usize);
         task.do_setsockopt(
             sock1,
             SocketOptionName::Socket(SocketOption::RCVTIMEO),

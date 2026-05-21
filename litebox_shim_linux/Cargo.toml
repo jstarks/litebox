@@ -25,6 +25,8 @@ default = []
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
+litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
+litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
 tempfile = "3"
 
 [lints]

@@ -1711,6 +1711,8 @@ dependencies = [
  "libc",
  "litebox",
  "litebox_common_linux",
+ "litebox_platform_linux_userland",
+ "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
  "litebox_util_log",
  "object",

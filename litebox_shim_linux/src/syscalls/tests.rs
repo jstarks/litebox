@@ -4,29 +4,35 @@
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::set_platform;
 use zerocopy::FromBytes as _;
 
 use crate::MutPtr;
 
 extern crate std;
 
+#[cfg(target_os = "linux")]
+pub(crate) type Platform = litebox_platform_linux_userland::LinuxUserland;
+#[cfg(target_os = "windows")]
+pub(crate) type Platform = litebox_platform_windows_userland::WindowsUserland;
+
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
 #[must_use]
-pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
-    static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
-    PLATFORM_INIT.call_once(|| {
+pub(crate) fn init_platform(
+    tun_device_name: Option<&str>,
+) -> crate::Task<Platform, crate::DefaultFS<Platform>> {
+    static PLATFORM: std::sync::OnceLock<&'static Platform> = std::sync::OnceLock::new();
+    let platform: &'static Platform = PLATFORM.get_or_init(|| {
         #[cfg(target_os = "linux")]
         let platform = Platform::new(tun_device_name);
 
         #[cfg(not(target_os = "linux"))]
         let platform = Platform::new();
 
-        set_platform(platform);
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(platform))
     });
 
-    let shim_builder = crate::LinuxShimBuilder::new();
+    let shim_builder = crate::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -184,7 +190,7 @@ fn test_getdent64() {
     let bytes_read = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            MutPtr::<Platform, _>::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -258,7 +264,7 @@ fn test_getdent64() {
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            MutPtr::<Platform, _>::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len()
         )
         .expect("Failed to read directory entries"),
@@ -276,7 +282,7 @@ fn test_getdent64() {
     let bytes = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(small_buffer.as_mut_ptr() as usize),
+            MutPtr::<Platform, _>::from_usize(small_buffer.as_mut_ptr() as usize),
             small_buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -297,7 +303,7 @@ fn test_getdent64() {
     // Test 3: Invalid file descriptor
     let result = task.sys_getdirent64(
         -1,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        MutPtr::<Platform, _>::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -314,7 +320,7 @@ fn test_getdent64() {
 
     let result = task.sys_getdirent64(
         file1_fd,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        MutPtr::<Platform, _>::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -325,7 +331,7 @@ fn test_getdent64() {
     task.sys_close(file1_fd).expect("Failed to close file");
 
     // Test 5: Zero-length buffer
-    let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
+    let result = task.sys_getdirent64(dir_fd, MutPtr::<Platform, _>::from_usize(buffer.as_mut_ptr() as usize), 0);
     assert_eq!(
         result,
         Err(Errno::EINVAL),
@@ -349,7 +355,7 @@ fn test_getdent64() {
         let bytes_read = task
             .sys_getdirent64(
                 dir_fd2,
-                MutPtr::from_usize(chunk_buffer.as_mut_ptr() as usize),
+                MutPtr::<Platform, _>::from_usize(chunk_buffer.as_mut_ptr() as usize),
                 chunk_buffer.len(),
             )
             .expect("Failed to read directory chunk");
@@ -625,10 +631,7 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
     // We run the test many times to increase the probability of hitting the
     // exact interleaving, since we rely on sleep-based synchronization.
     for _ in 0..200 {
-        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
-            P,
-            u32,
-        >::new(0));
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<crate::syscalls::tests::Platform, u32>::new(0));
         // Step 1: W1 acquires the write lock on the main thread.
         let mut w1_guard = lock.write();
 

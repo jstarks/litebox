@@ -2349,11 +2349,11 @@ mod tests {
         let second = b"second";
         let iovs = [
             IoWriteVec {
-                iov_base: ConstPtr::<P, _>::from_usize(first.as_ptr().expose_provenance()),
+                iov_base: ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(first.as_ptr().expose_provenance()),
                 iov_len: first.len(),
             },
             IoWriteVec {
-                iov_base: ConstPtr::<P, _>::from_usize(second.as_ptr().expose_provenance()),
+                iov_base: ConstPtr::<crate::syscalls::tests::Platform, _>::from_usize(second.as_ptr().expose_provenance()),
                 iov_len: second.len(),
             },
         ];

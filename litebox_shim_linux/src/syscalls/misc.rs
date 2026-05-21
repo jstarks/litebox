@@ -172,7 +172,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut buf = [0u8; 16];
-        let ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
+        let ptr = crate::MutPtr::<crate::syscalls::tests::Platform, _>::from_ptr(buf.as_mut_ptr());
         let count = task
             .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
             .expect("getrandom failed");
@@ -189,7 +189,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut utsname = litebox_common_linux::Utsname::new_zeroed();
-        let ptr = crate::MutPtr::from_ptr(&raw mut utsname);
+        let ptr = crate::MutPtr::<crate::syscalls::tests::Platform, _>::from_ptr(&raw mut utsname);
         task.sys_uname(ptr).expect("uname failed");
 
         assert_eq!(utsname.sysname, super::SYS_INFO.sysname);

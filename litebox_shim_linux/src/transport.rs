@@ -258,9 +258,9 @@ mod tests {
     }
 
     fn connect_9p(
-        task: &crate::Task<crate::test_utils::TestPlatform, crate::DefaultFS<crate::test_utils::TestPlatform>>,
+        task: &crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::test_utils::TestPlatform, ShimTransport<crate::test_utils::TestPlatform>> {
+    ) -> nine_p::FileSystem<crate::syscalls::tests::Platform, ShimTransport<crate::syscalls::tests::Platform>> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");

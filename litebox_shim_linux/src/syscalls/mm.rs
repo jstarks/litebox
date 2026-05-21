@@ -1398,7 +1398,7 @@ mod tests {
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
         let err = task
             .sys_mremap(
-                crate::MutPtr::<P, _>::from_usize(addr - 0x1000),
+                crate::MutPtr::<crate::syscalls::tests::Platform, _>::from_usize(addr - 0x1000),
                 0x1000,
                 0x2000,
                 MRemapFlags::empty(),
@@ -1542,7 +1542,7 @@ mod tests {
     fn test_fallible_read() {
         let _ = init_platform(None);
 
-        let ptr = crate::MutPtr::<P, u8>::from_usize(0xdeadbeef);
+        let ptr = crate::MutPtr::<crate::syscalls::tests::Platform, u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset(0);
         assert!(result.is_none());
     }

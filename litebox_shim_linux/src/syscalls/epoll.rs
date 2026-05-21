@@ -618,14 +618,14 @@ mod test {
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, EpollEvent};
-    use litebox_platform_multiplex::platform;
+    
 
     use super::EpollFile;
     use crate::syscalls::file::FilesState;
 
     extern crate std;
 
-    fn setup_epoll() -> (crate::Task<crate::DefaultFS>, EpollFile<crate::DefaultFS>) {
+    fn setup_epoll() -> (crate::Task<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>, EpollFile<crate::syscalls::tests::Platform, crate::DefaultFS<crate::syscalls::tests::Platform>>) {
         let task = crate::syscalls::tests::init_platform(None);
 
         let epoll = EpollFile::new();
@@ -640,7 +640,7 @@ mod test {
             .global
             .litebox
             .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem<P>>(eventfd);
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(eventfd);
         let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(raw_fd) = files.insert_raw_fd(typed) else {
             unreachable!()
@@ -666,18 +666,18 @@ mod test {
                 let typed = files
                     .raw_descriptor_store
                     .read()
-                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(raw_fd)
                     .unwrap();
                 let _ = global
                     .litebox
                     .descriptor_table()
                     .with_entry(&typed, |entry| {
-                        entry.write(&WaitState::new(platform()).context(), 1)
+                        entry.write(&WaitState::new(global.platform).context(), 1)
                     });
             });
         }
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(&task.global, &WaitState::new(task.global.platform).context(), 1024)
             .unwrap();
     }
 
@@ -709,18 +709,18 @@ mod test {
             assert_eq!(
                 global
                     .pipes
-                    .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
+                    .write(&WaitState::new(global.platform).context(), &producer, &[1, 2])
                     .unwrap(),
                 2
             );
         });
         epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            .wait(&task.global, &WaitState::new(task.global.platform).context(), 1024)
             .unwrap();
         let mut buf = [0; 2];
         task.global
             .pipes
-            .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
+            .read(&WaitState::new(task.global.platform).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
     }
@@ -729,14 +729,14 @@ mod test {
     fn test_poll() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        let mut set = super::PollSet::with_capacity(0);
+        let mut set = super::PollSet::<crate::syscalls::tests::Platform>::with_capacity(0);
         let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
 
         let typed = task
             .global
             .litebox
             .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem<P>>(eventfd);
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(eventfd);
         let no_fds = FilesState::new(task.files.borrow().fs.clone());
         let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(raw_fd) = fds.insert_raw_fd(typed) else {
@@ -745,13 +745,13 @@ mod test {
         let fd = i32::try_from(raw_fd).unwrap();
         set.add_fd(fd, Events::IN);
 
-        let revents = |set: &super::PollSet| {
+        let revents = |set: &super::PollSet<crate::syscalls::tests::Platform>| {
             let revents: std::vec::Vec<_> = set.revents().collect();
             assert_eq!(revents.len(), 1);
             revents[0]
         };
 
-        set.wait(&task.global, &WaitState::new(platform()).context(), &no_fds)
+        set.wait(&task.global, &WaitState::new(task.global.platform).context(), &no_fds)
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
@@ -759,16 +759,16 @@ mod test {
             let typed = fds
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(raw_fd)
                 .unwrap();
             task.global
                 .litebox
                 .descriptor_table()
                 .with_entry(&typed, |entry| {
-                    entry.write(&WaitState::new(platform()).context(), 1)
+                    entry.write(&WaitState::new(task.global.platform).context(), 1)
                 });
         }
-        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
+        set.wait(&task.global, &WaitState::new(task.global.platform).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
@@ -776,18 +776,18 @@ mod test {
             let typed = fds
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(raw_fd)
                 .unwrap();
             task.global
                 .litebox
                 .descriptor_table()
                 .with_entry(&typed, |entry| {
-                    entry.read(&WaitState::new(platform()).context())
+                    entry.read(&WaitState::new(task.global.platform).context())
                 });
         }
         set.wait(
             &task.global,
-            &WaitState::new(platform())
+            &WaitState::new(task.global.platform)
                 .context()
                 .with_timeout(core::time::Duration::from_millis(100)),
             &fds,
@@ -802,7 +802,7 @@ mod test {
             let typed = fds_for_thread
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<crate::syscalls::tests::Platform>>(raw_fd)
                 .unwrap();
             let handle = global
                 .litebox
@@ -810,10 +810,10 @@ mod test {
                 .entry_handle(&typed)
                 .unwrap();
             let _ =
-                handle.with_entry(|entry| entry.write(&WaitState::new(platform()).context(), 1));
+                handle.with_entry(|entry| entry.write(&WaitState::new(global.platform).context(), 1));
         });
 
-        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
+        set.wait(&task.global, &WaitState::new(task.global.platform).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
     }
