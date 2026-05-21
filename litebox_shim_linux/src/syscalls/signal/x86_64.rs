@@ -44,7 +44,7 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr
 }
 
-impl SignalState {
+impl<P: crate::ShimPlatform> SignalState<P> {
     pub(super) fn write_signal_frame(
         &self,
         frame_addr: usize,
@@ -98,7 +98,7 @@ impl SignalState {
             siginfo: siginfo.clone(),
         };
 
-        let frame_ptr = MutPtr::from_usize(frame_addr);
+        let frame_ptr = MutPtr::<P, _>::from_usize(frame_addr);
         frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
 
         ctx.rsp = frame_addr;

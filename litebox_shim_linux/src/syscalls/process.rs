@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -27,14 +27,14 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
-use litebox_platform_multiplex::Platform;
+
 
 /// Process-management-related state on [`Task`].
-pub(crate) struct ThreadState {
-    init_state: Cell<ThreadInitState>,
-    process: Arc<Process>,
+pub(crate) struct ThreadState<P: ShimPlatform> {
+    init_state: Cell<ThreadInitState<P>>,
+    process: Arc<Process<P>>,
     /// Thread state that can be accessed from a remote thread.
-    remote: Arc<ThreadRemote>,
+    remote: Arc<ThreadRemote<P>>,
     attached_tid: Cell<Option<i32>>,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
     /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
@@ -43,18 +43,18 @@ pub(crate) struct ThreadState {
     ///
     /// This operation wakes a single thread waiting on the specified memory location via futex.
     /// Any errors from the futex wake operation are ignored.
-    clear_child_tid: Cell<Option<MutPtr<i32>>>,
+    clear_child_tid: Cell<Option<MutPtr<P, i32>>>,
     /// The purpose of the robust futex list is to ensure that if a thread accidentally fails to unlock a futex before
     /// terminating or calling execve(2), another thread that is waiting on that futex is notified that the former owner
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
-    robust_list: Cell<Option<ConstPtr<litebox_common_linux::RobustListHead>>>,
+    robust_list: Cell<Option<ConstPtr<P, litebox_common_linux::RobustListHead>>>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
-unsafe impl Send for ThreadState {}
+unsafe impl<P: ShimPlatform> Send for ThreadState<P> {}
 
-impl ThreadState {
+impl<P: ShimPlatform> ThreadState<P> {
     pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
@@ -86,22 +86,22 @@ impl ThreadState {
     }
 }
 
-impl Drop for ThreadState {
+impl<P: ShimPlatform> Drop for ThreadState<P> {
     fn drop(&mut self) {
         self.detach_from_process();
     }
 }
 
 /// Thread state that can be accessed from a remote thread.
-struct ThreadRemote {
+struct ThreadRemote<P: ShimPlatform> {
     /// Always set under the process `inner` lock, but can be read without
     /// locking.
     is_exiting: AtomicBool,
     /// Handle to interrupt waits on this thread.
-    handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<P>>,
 }
 
-impl ThreadRemote {
+impl<P: ShimPlatform> ThreadRemote<P> {
     fn new() -> Self {
         Self {
             is_exiting: AtomicBool::new(false),
@@ -117,27 +117,27 @@ impl ThreadRemote {
 }
 
 /// A Linux process, which may have multiple threads.
-pub(crate) struct Process {
+pub(crate) struct Process<P: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads:
-        <litebox_platform_multiplex::Platform as litebox::platform::RawMutexProvider>::RawMutex,
-    inner: Mutex<Platform, ProcessInner>,
+        <P as litebox::platform::RawMutexProvider>::RawMutex,
+    inner: Mutex<P, ProcessInner<P>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
-    pub(crate) alarm_timer: Mutex<Platform, Alarm>,
+    pub(crate) alarm_timer: Mutex<P, Alarm<P>>,
 }
 
-pub(crate) struct Alarm {
+pub(crate) struct Alarm<P: ShimPlatform> {
     /// Handle for the alarm timer.
-    pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
+    pub(crate) handle: Option<<P as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
-    pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+    pub(crate) deadline: Option<<P as litebox::platform::TimeProvider>::Instant>,
 }
 
 /// The locked portion of the process state.
-struct ProcessInner {
+struct ProcessInner<P: ShimPlatform> {
     /// If true, the whole process is exiting.
     group_exit: bool,
     /// If true, one thread is waiting for other threads to exit.
@@ -146,7 +146,7 @@ struct ProcessInner {
     /// `group_exit` is set.
     exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
-    threads: BTreeMap<i32, Arc<ThreadRemote>>,
+    threads: BTreeMap<i32, Arc<ThreadRemote<P>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,10 +155,10 @@ pub(crate) enum ExitStatus {
     Signal(litebox_common_linux::signal::Signal),
 }
 
-impl Process {
+impl<P: ShimPlatform> Process<P> {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
-        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+    fn new(pid: i32, remote: Arc<ThreadRemote<P>>) -> Self {
+        let nr_threads = <P as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
@@ -195,7 +195,7 @@ impl Process {
 
     /// Attaches a new thread to this process, returning a new remote state for
     /// the thread.
-    fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote>> {
+    fn attach_thread(&self, tid: i32) -> Option<Arc<ThreadRemote<P>>> {
         // Allocate outside the lock.
         let remote = Arc::new(ThreadRemote::new());
         let mut inner = self.inner.lock();
@@ -241,7 +241,7 @@ impl Process {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
@@ -313,14 +313,14 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 #[derive(Default)]
-enum ThreadInitState {
+enum ThreadInitState<P: ShimPlatform> {
     #[default]
     None,
     NewProcess(crate::loader::elf::ElfLoadInfo),
     NewThread {
         stack: Option<usize>,
-        tls: Option<ThreadLocalDescriptor>,
-        set_child_tid: Option<MutPtr<i32>>,
+        tls: Option<ThreadLocalDescriptor<P>>,
+        set_child_tid: Option<MutPtr<P, i32>>,
     },
 }
 
@@ -333,8 +333,8 @@ pub(crate) struct Credentials {
     pub egid: u32,
 }
 
-impl<FS: ShimFS> Task<FS> {
-    pub(crate) fn process(&self) -> &Arc<Process> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
+    pub(crate) fn process(&self) -> &Arc<Process<P>> {
         &self.thread.process
     }
 
@@ -349,7 +349,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `prctl`.
     pub(crate) fn sys_prctl(
         &self,
-        arg: PrctlArg<litebox_platform_multiplex::Platform>,
+        arg: PrctlArg<P>,
     ) -> Result<usize, Errno> {
         match arg {
             PrctlArg::GetName(name) => name
@@ -387,38 +387,23 @@ impl<FS: ShimFS> Task<FS> {
             _ => unimplemented!(),
         }
     }
+}
 
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `arch_prctl`.
     pub(crate) fn sys_arch_prctl(
         &self,
-        arg: ArchPrctlArg<litebox_platform_multiplex::Platform>,
+        arg: ArchPrctlArg<P>,
     ) -> Result<(), Errno> {
         match arg {
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::SetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-                let token = self
-                    .global
-                    .platform
-                    .get_punchthrough_token_for(punchthrough)
-                    .expect("Failed to get punchthrough token for SET_FS");
-                token.execute().map(|_| ()).map_err(|e| match e {
-                    litebox::platform::PunchthroughError::Failure(errno) => errno,
-                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })
+                self.global.platform.do_punchthrough(litebox_common_linux::PunchthroughSyscall::SetFsBase { addr })
+                    .map(|_| ())
             }
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
-                let token = self
-                    .global
-                    .platform
-                    .get_punchthrough_token_for(punchthrough)
-                    .expect("Failed to get punchthrough token for GET_FS");
-                let fsbase = token.execute().map_err(|e| match e {
-                    litebox::platform::PunchthroughError::Failure(errno) => errno,
-                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })?;
+                let fsbase = self.global.platform.do_punchthrough(litebox_common_linux::PunchthroughSyscall::GetFsBase)?;
                 addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
                 Ok(())
             }
@@ -436,8 +421,8 @@ const ROBUST_LIST_LIMIT: isize = 2048;
  * Process a futex-list entry, check whether it's owned by the
  * dying task, and do notification if so:
  */
-fn handle_futex_death(
-    futex_addr: crate::ConstPtr<u32>,
+fn handle_futex_death<P: ShimPlatform>(
+    futex_addr: crate::ConstPtr<P, u32>,
     _pi: bool,
     _pending_op: bool,
 ) -> Result<(), Errno> {
@@ -448,30 +433,30 @@ fn handle_futex_death(
     todo!("handle_futex_death is not implemented yet");
 }
 
-fn fetch_robust_entry(
-    head: crate::ConstPtr<litebox_common_linux::RobustList>,
-) -> (crate::ConstPtr<litebox_common_linux::RobustList>, bool) {
+fn fetch_robust_entry<P: ShimPlatform>(
+    head: crate::ConstPtr<P, litebox_common_linux::RobustList>,
+) -> (crate::ConstPtr<P, litebox_common_linux::RobustList>, bool) {
     let next = head.as_usize();
-    (crate::ConstPtr::from_usize(next & !1), next & 1 != 0)
+    (crate::ConstPtr::<P, _>::from_usize(next & !1), next & 1 != 0)
 }
 
-fn wake_robust_list(
-    head: crate::ConstPtr<litebox_common_linux::RobustListHead>,
+fn wake_robust_list<P: ShimPlatform>(
+    head: crate::ConstPtr<P, litebox_common_linux::RobustListHead>,
 ) -> Result<(), Errno> {
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
     let head = head.read_at_offset(0).ok_or(Errno::EFAULT)?;
-    let (mut entry, mut pi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list.next));
-    let (pending, ppi) = fetch_robust_entry(crate::ConstPtr::from_usize(head.list_op_pending));
+    let (mut entry, mut pi): (crate::ConstPtr<P, litebox_common_linux::RobustList>, bool) = fetch_robust_entry::<P>(crate::ConstPtr::<P, _>::from_usize(head.list.next));
+    let (pending, ppi): (crate::ConstPtr<P, litebox_common_linux::RobustList>, bool) = fetch_robust_entry::<P>(crate::ConstPtr::<P, _>::from_usize(head.list_op_pending));
     let futex_offset = head.futex_offset;
     let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
     while entry.as_usize() != entry_head && limit > 0 {
         let nxt = entry
             .read_at_offset(0)
-            .map(|e| fetch_robust_entry(crate::ConstPtr::from_usize(e.next)));
+            .map(|e| fetch_robust_entry::<P>(crate::ConstPtr::<P, _>::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
-            handle_futex_death(
-                crate::ConstPtr::from_usize(entry.as_usize() + futex_offset),
+            handle_futex_death::<P>(
+                crate::ConstPtr::<P, _>::from_usize(entry.as_usize() + futex_offset),
                 pi,
                 false,
             )?;
@@ -486,8 +471,8 @@ fn wake_robust_list(
     }
 
     if pending.as_usize() != 0 {
-        let _ = handle_futex_death(
-            crate::ConstPtr::from_usize(pending.as_usize() + futex_offset),
+        let _ = handle_futex_death::<P>(
+            crate::ConstPtr::<P, _>::from_usize(pending.as_usize() + futex_offset),
             ppi,
             true,
         );
@@ -495,7 +480,7 @@ fn wake_robust_list(
     Ok(())
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
         self.thread.detach_from_process();
@@ -505,7 +490,7 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: if we are the last thread, we don't need to clear it
             let _ = clear_child_tid.write_at_offset(0, 0);
             // Cast from *i32 to *u32
-            let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid.as_usize());
+            let clear_child_tid = crate::MutPtr::<P, _>::from_usize(clear_child_tid.as_usize());
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
                 flags: litebox_common_linux::FutexFlags::PRIVATE,
@@ -513,7 +498,7 @@ impl<FS: ShimFS> Task<FS> {
             });
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list(robust_list);
+            let _ = wake_robust_list::<P>(robust_list);
         }
     }
 
@@ -534,14 +519,14 @@ impl<FS: ShimFS> Task<FS> {
 /// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
 /// an arbitrary-sized memory region.
 #[cfg(target_arch = "x86_64")]
-type ThreadLocalDescriptor = MutPtr<u8>;
+type ThreadLocalDescriptor<P: crate::ShimPlatform> = MutPtr<P, u8>;
 
-struct NewThreadArgs<FS: ShimFS> {
+struct NewThreadArgs<P: ShimPlatform, FS: ShimFS> {
     /// Task struct that maintains all per-thread data
-    task: Task<FS>,
+    task: Task<P, FS>,
 }
 
-impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
+impl<P: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<P, FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(
@@ -557,7 +542,7 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     pub(crate) fn sys_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -569,7 +554,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_clone3(
         &self,
         ctx: &litebox_common_linux::PtRegs,
-        args: ConstPtr<litebox_common_linux::CloneArgs>,
+        args: ConstPtr<P, litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
         let args = args.read_at_offset(0).ok_or(Errno::EFAULT)?;
         self.do_clone(ctx, &args, true)
@@ -655,7 +640,7 @@ impl<FS: ShimFS> Task<FS> {
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.truncate();
             #[cfg(target_arch = "x86_64")]
-            let desc = MutPtr::from_usize(addr);
+            let desc = MutPtr::<P, _>::from_usize(addr);
             Some(desc)
         } else {
             None
@@ -664,7 +649,7 @@ impl<FS: ShimFS> Task<FS> {
         let child_tid = if child_tid == 0 {
             None
         } else {
-            Some(MutPtr::from_usize(child_tid.truncate()))
+            Some(MutPtr::<P, _>::from_usize(child_tid.truncate()))
         };
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
             child_tid
@@ -677,7 +662,7 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
-            Some(MutPtr::from_usize(parent_tid.truncate()))
+            Some(MutPtr::<P, _>::from_usize(parent_tid.truncate()))
         } else {
             None
         };
@@ -743,7 +728,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `set_tid_address`.
-    pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<i32>) -> i32 {
+    pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<P, i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));
         self.tid
     }
@@ -823,7 +808,7 @@ impl ResourceLimits {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Get resource limits, and optionally set new limits.
     pub(crate) fn do_prlimit(
         &self,
@@ -874,8 +859,8 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         pid: i32,
         resource: litebox_common_linux::RlimitResource,
-        new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
-        old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
+        new_rlim: Option<crate::ConstPtr<P, litebox_common_linux::Rlimit64>>,
+        old_rlim: Option<crate::MutPtr<P, litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
         if pid != 0 {
             unimplemented!("prlimit for a specific PID is not supported yet");
@@ -901,7 +886,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_getrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: crate::MutPtr<litebox_common_linux::Rlimit>,
+        rlim: crate::MutPtr<P, litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset(0, old_limit).ok_or(Errno::EINVAL)
@@ -911,7 +896,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_setrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: crate::ConstPtr<litebox_common_linux::Rlimit>,
+        rlim: crate::ConstPtr<P, litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let new_limit = rlim.read_at_offset(0).ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
@@ -920,7 +905,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `set_robust_list`.
     pub(crate) fn sys_set_robust_list(&self, head: usize) {
-        let head = crate::ConstPtr::from_usize(head);
+        let head = crate::ConstPtr::<P, _>::from_usize(head);
         self.thread.robust_list.set(Some(head));
     }
 
@@ -928,7 +913,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_get_robust_list(
         &self,
         pid: Option<i32>,
-        head_ptr: crate::MutPtr<usize>,
+        head_ptr: crate::MutPtr<P, usize>,
     ) -> Result<(), Errno> {
         if pid.is_some() {
             unimplemented!("Getting robust list for a specific PID is not supported yet");
@@ -944,7 +929,7 @@ impl<FS: ShimFS> Task<FS> {
     fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
         let now = self.global.platform.current_time();
         let unix_epoch =
-            <litebox_platform_multiplex::Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
+            <P as TimeProvider>::SystemTime::UNIX_EPOCH;
         now.duration_since(&unix_epoch)
             .expect("must be after unix epoch")
     }
@@ -953,7 +938,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_clock_gettime(
         &self,
         clockid: litebox_common_linux::ClockId,
-        tp: TimeParam<Platform>,
+        tp: TimeParam<P>,
     ) -> Result<(), Errno> {
         let duration = self.gettime_as_duration(clockid)?;
         tp.write(duration)
@@ -993,7 +978,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Convert an absolute time, specified as a duration since the epoch of the
-    /// given clock, to a `Platform::Instant` suitable for use as a deadline.
+    /// given clock, to a `P::Instant` suitable for use as a deadline.
     ///
     /// If the time is so far in the future that it cannot be represented as an
     /// `Instant`, returns `Ok(None)`. If the time occurs in the past, returns
@@ -1002,7 +987,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         clock_id: litebox_common_linux::ClockId,
         duration: Duration,
-    ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
+    ) -> Result<Option<<P as TimeProvider>::Instant>, Errno> {
         match clock_id {
             litebox_common_linux::ClockId::Monotonic
             | litebox_common_linux::ClockId::MonotonicCoarse => {
@@ -1027,7 +1012,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_clock_getres(
         &self,
         clockid: litebox_common_linux::ClockId,
-        res: TimeParam<Platform>,
+        res: TimeParam<P>,
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
@@ -1051,8 +1036,8 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         clockid: litebox_common_linux::ClockId,
         flags: litebox_common_linux::TimerFlags,
-        request: TimeParam<Platform>,
-        remain: TimeParam<Platform>,
+        request: TimeParam<P>,
+        remain: TimeParam<P>,
     ) -> Result<(), Errno> {
         let request = request.read()?.ok_or(Errno::EFAULT)?;
         if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
@@ -1089,8 +1074,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `gettimeofday`.
     pub(crate) fn sys_gettimeofday(
         &self,
-        tv: Option<crate::MutPtr<litebox_common_linux::TimeVal>>,
-        tz: Option<crate::MutPtr<litebox_common_linux::TimeZone>>,
+        tv: Option<crate::MutPtr<P, litebox_common_linux::TimeVal>>,
+        tz: Option<crate::MutPtr<P, litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
         if let Some(tz) = tz {
             // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
@@ -1109,7 +1094,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `time`.
     pub(crate) fn sys_time(
         &self,
-        tloc: Option<crate::MutPtr<litebox_common_linux::time_t>>,
+        tloc: Option<crate::MutPtr<P, litebox_common_linux::time_t>>,
     ) -> Result<litebox_common_linux::time_t, Errno> {
         let time = self.real_time_as_duration_since_epoch();
         let seconds: u64 = time.as_secs();
@@ -1220,7 +1205,7 @@ impl CpuSet {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -1231,11 +1216,11 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(
         &self,
-        arg: litebox_common_linux::FutexArgs<litebox_platform_multiplex::Platform>,
+        arg: litebox_common_linux::FutexArgs<P>,
     ) -> Result<usize, Errno> {
         /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
         /// It should be fine to treat shared futexes as private for now.
@@ -1341,7 +1326,7 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
     /// Otherwise, returns the original path and argv.
     pub(crate) fn resolve_shebang(
@@ -1391,19 +1376,19 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: crate::ConstPtr<i8>,
-        argv: crate::ConstPtr<crate::ConstPtr<i8>>,
-        envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        pathname: crate::ConstPtr<P, i8>,
+        argv: crate::ConstPtr<P, crate::ConstPtr<P, i8>>,
+        envp: crate::ConstPtr<P, crate::ConstPtr<P, i8>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        fn copy_vector(
-            mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+        fn copy_vector<P: ShimPlatform>(
+            mut base: crate::ConstPtr<P, crate::ConstPtr<P, i8>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::ConstPtr<i8> = {
+                let p: crate::ConstPtr<P, i8> = {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
                         Some(ptr) => ptr,
@@ -1422,7 +1407,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 out.push(cs);
                 // advance to next pointer
-                base = crate::ConstPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+                base = crate::ConstPtr::<P, _>::from_usize(base.as_usize() + core::mem::size_of::<usize>());
             }
             Ok(out)
         }
@@ -1437,12 +1422,12 @@ impl<FS: ShimFS> Task<FS> {
         let argv_vec = if argv.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
-            copy_vector(argv, "argv")?
+            copy_vector::<P>(argv, "argv")?
         };
         let envp_vec = if envp.as_usize() == 0 {
             alloc::vec::Vec::new()
         } else {
-            copy_vector(envp, "envp")?
+            copy_vector::<P>(envp, "envp")?
         };
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
@@ -1463,7 +1448,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list(robust_list);
+            let _ = wake_robust_list::<P>(robust_list);
         }
         self.thread.clear_child_tid.set(None);
 
@@ -1474,7 +1459,7 @@ impl<FS: ShimFS> Task<FS> {
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
-        litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
+        P::clear_guest_thread_local_storage();
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
@@ -1487,7 +1472,7 @@ impl<FS: ShimFS> Task<FS> {
     /// to start executing it.
     pub(crate) fn load_program(
         &self,
-        mut loader: crate::loader::elf::ElfLoader<'_, FS>,
+        mut loader: crate::loader::elf::ElfLoader<'_, P, FS>,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
@@ -1610,7 +1595,7 @@ mod tests {
         assert_eq!(current_fs_base, new_fs_base.as_ptr() as usize);
 
         // Restore old FS base
-        let ptr: crate::MutPtr<u8> = crate::MutPtr::from_usize(old_fs_base);
+        let ptr: crate::MutPtr<P, u8> = crate::MutPtr::<P, _>::from_usize(old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to restore FS base");
     }
@@ -1689,7 +1674,7 @@ mod tests {
 
         let callback_addr = 0x1000usize; // dummy non-null address for the callback
         let task = crate::syscalls::tests::init_platform(None);
-        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+        <P as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let act = SigAction {
                 sigaction: callback_addr,
                 flags: SaFlags::RESTORER,
@@ -1758,7 +1743,7 @@ mod tests {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let task = crate::syscalls::tests::init_platform(None);
-        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+        <P as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
 
             // Set a 1-second alarm.
@@ -1817,7 +1802,7 @@ mod tests {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let task = crate::syscalls::tests::init_platform(None);
-        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+        <P as litebox::platform::ThreadProvider>::run_test_thread(|| {
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
             // Cancel before it fires.
             let remaining = task.sys_alarm(0).unwrap();
@@ -1852,7 +1837,7 @@ mod tests {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let task = crate::syscalls::tests::init_platform(None);
-        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+        <P as litebox::platform::ThreadProvider>::run_test_thread(|| {
             // Install SIG_IGN for SIGALRM.
             let act = SigAction {
                 sigaction: SIG_IGN,
@@ -1908,7 +1893,7 @@ mod tests {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let task = crate::syscalls::tests::init_platform(None);
-        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+        <P as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
 
             // Create a timer that requests SIGUSR1

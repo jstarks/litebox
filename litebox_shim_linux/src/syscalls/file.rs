@@ -20,22 +20,22 @@ use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
     IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
 };
-use litebox_platform_multiplex::Platform;
+
 use thiserror::Error;
 
-use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
+use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, ShimPlatform, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Task state shared by `CLONE_FS`.
-pub(crate) struct FsState {
+pub(crate) struct FsState<P: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
     /// The current working directory
     ///
     /// Must end with a '/'.
-    cwd: litebox::sync::RwLock<Platform, String>,
+    cwd: litebox::sync::RwLock<P, String>,
 }
 
-impl Clone for FsState {
+impl<P: ShimPlatform> Clone for FsState<P> {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
@@ -44,7 +44,7 @@ impl Clone for FsState {
     }
 }
 
-impl FsState {
+impl<P: ShimPlatform> FsState<P> {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
@@ -58,15 +58,15 @@ impl FsState {
 }
 
 /// Task state shared by `CLONE_FILES`.
-pub(crate) struct FilesState<FS: ShimFS> {
+pub(crate) struct FilesState<P: ShimPlatform, FS: ShimFS> {
     /// The filesystem implementation, shared across tasks that share file system.
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
-        litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+        litebox::sync::RwLock<P, litebox::fd::RawDescriptorStorage>,
     max_fd: AtomicUsize,
 }
 
-impl<FS: ShimFS> FilesState<FS> {
+impl<P: ShimPlatform, FS: ShimFS> FilesState<P, FS> {
     pub(crate) fn new(fs: alloc::sync::Arc<FS>) -> Self {
         Self {
             fs,
@@ -161,7 +161,7 @@ impl FsPath {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -544,7 +544,7 @@ pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `lseek`
     pub fn sys_lseek(&self, fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -610,18 +610,18 @@ impl<FS: ShimFS> Task<FS> {
         raw_fd: usize,
         replace: Option<TypedFd<S>>,
     ) -> Result<(), Errno> {
-        enum ConsumedFd<FS: ShimFS> {
+        enum ConsumedFd<P: ShimPlatform, FS: ShimFS> {
             Fs(alloc::sync::Arc<TypedFd<FS>>),
-            Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
-            Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
-            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
-            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<FS>>>),
+            Network(alloc::sync::Arc<TypedFd<litebox::net::Network<P>>>),
+            Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<P>>>),
+            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<P>>>),
+            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<P, FS>>>),
+            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<P, FS>>>),
         }
 
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        let consumed: ConsumedFd<FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
+        let consumed: ConsumedFd<P, FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
@@ -632,23 +632,23 @@ impl<FS: ShimFS> Task<FS> {
             }
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
                 if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(raw_fd)
+                    rds.fd_consume_raw_integer::<litebox::net::Network<P>>(raw_fd)
                 {
                     ConsumedFd::Network(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<P>>(raw_fd)
                 {
                     ConsumedFd::Pipes(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem<P>>(raw_fd)
                 {
                     ConsumedFd::Eventfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<P, FS>>(raw_fd)
                 {
                     ConsumedFd::Epoll(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<P, FS>>(raw_fd)
                 {
                     ConsumedFd::Unix(fd)
                 } else {
@@ -718,13 +718,13 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_readv(
         &self,
         fd: i32,
-        iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+        iovec: ConstPtr<P, IoReadVec<MutPtr<P, u8>>>,
         iovcnt: usize,
     ) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
+        let iovs: &[IoReadVec<MutPtr<P, u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let mut total_read = 0;
         let mut kernel_buffer = vec![
@@ -811,18 +811,18 @@ where
     Ok(total_written)
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `writev`
     pub fn sys_writev(
         &self,
         fd: i32,
-        iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+        iovec: ConstPtr<P, IoWriteVec<ConstPtr<P, u8>>>,
         iovcnt: usize,
     ) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        let iovs: &[IoWriteVec<ConstPtr<u8>>] =
+        let iovs: &[IoWriteVec<ConstPtr<P, u8>>] =
             &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
@@ -932,7 +932,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
+fn descriptor_stat<P: ShimPlatform, FS: ShimFS>(raw_fd: usize, task: &Task<P, FS>) -> Result<FileStat, Errno> {
     let fstat = task
         .files
         .borrow()
@@ -1042,15 +1042,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
     Ok(fstat)
 }
 
-pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
+pub(crate) fn get_file_descriptor_flags<P: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<FS>,
-    files: &FilesState<FS>,
+    global: &GlobalState<P, FS>,
+    files: &FilesState<P, FS>,
 ) -> Result<FileDescriptorFlags, Errno> {
     // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
     // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-    fn get_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<FS>,
+    fn get_flags<P: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+        global: &GlobalState<P, FS>,
         fd: &TypedFd<S>,
     ) -> FileDescriptorFlags {
         global
@@ -1070,14 +1070,14 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
     )
 }
 
-fn set_file_descriptor_flags<FS: ShimFS>(
+fn set_file_descriptor_flags<P: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<FS>,
-    files: &FilesState<FS>,
+    global: &GlobalState<P, FS>,
+    files: &FilesState<P, FS>,
     flags: FileDescriptorFlags,
 ) -> Result<(), Errno> {
-    fn set_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<FS>,
+    fn set_flags<P: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+        global: &GlobalState<P, FS>,
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {
@@ -1099,7 +1099,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
     Ok(())
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
@@ -1177,7 +1177,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_fcntl(
         &self,
         fd: i32,
-        arg: FcntlArg<litebox_platform_multiplex::Platform>,
+        arg: FcntlArg<P>,
     ) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -1450,7 +1450,7 @@ impl<FS: ShimFS> Task<FS> {
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let (pipe_flags, cloexec) = {
@@ -1525,7 +1525,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+        let typed = dt.insert::<super::eventfd::EventfdSubsystem<P>>(eventfd);
         if flags.contains(EfdFlags::CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
@@ -1545,7 +1545,7 @@ impl<FS: ShimFS> Task<FS> {
 
     fn stdio_ioctl(
         &self,
-        arg: &IoctlArg<litebox_platform_multiplex::Platform>,
+        arg: &IoctlArg<P>,
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
@@ -1600,7 +1600,7 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_ioctl(
         &self,
         fd: i32,
-        arg: IoctlArg<litebox_platform_multiplex::Platform>,
+        arg: IoctlArg<P>,
     ) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
@@ -1755,7 +1755,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let epoll_file = super::epoll::EpollFile::new();
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::epoll::EpollSubsystem<FS>>(epoll_file);
+        let typed = dt.insert::<super::epoll::EpollSubsystem<P, FS>>(epoll_file);
         if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
@@ -1779,7 +1779,7 @@ impl<FS: ShimFS> Task<FS> {
         epfd: i32,
         op: litebox_common_linux::EpollOp,
         fd: i32,
-        event: ConstPtr<litebox_common_linux::EpollEvent>,
+        event: ConstPtr<P, litebox_common_linux::EpollEvent>,
     ) -> Result<(), Errno> {
         let Ok(epfd) = u32::try_from(epfd) else {
             return Err(Errno::EBADF);
@@ -1796,7 +1796,7 @@ impl<FS: ShimFS> Task<FS> {
         let epoll_fd = files
             .raw_descriptor_store
             .read()
-            .fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(epfd as usize)
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<P, FS>>(epfd as usize)
             .map_err(|_| Errno::EBADF)?;
         let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
 
@@ -1818,10 +1818,10 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_epoll_pwait(
         &self,
         epfd: i32,
-        events: MutPtr<litebox_common_linux::EpollEvent>,
+        events: MutPtr<P, litebox_common_linux::EpollEvent>,
         maxevents: u32,
         timeout: i32,
-        sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
+        sigmask: Option<ConstPtr<P, litebox_common_linux::signal::SigSet>>,
         _sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
@@ -1850,7 +1850,7 @@ impl<FS: ShimFS> Task<FS> {
                     files
                         .raw_descriptor_store
                         .read()
-                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(raw_fd)
+                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<P, FS>>(raw_fd)
                 else {
                     return Err(Errno::EBADF);
                 };
@@ -1884,10 +1884,10 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `ppoll`.
     pub fn sys_ppoll(
         &self,
-        fds: MutPtr<litebox_common_linux::Pollfd>,
+        fds: MutPtr<P, litebox_common_linux::Pollfd>,
         nfds: usize,
-        timeout: TimeParam<Platform>,
-        sigmask: Option<ConstPtr<litebox_common_linux::signal::SigSet>>,
+        timeout: TimeParam<P>,
+        sigmask: Option<ConstPtr<P, litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigmask.is_some() {
@@ -1933,7 +1933,7 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: This is not great from a provenance perspective. Consider
             // adding cast+add methods to ConstPtr/MutPtr.
             let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
-            let revents_ptr = crate::MutPtr::<i16>::from_usize(
+            let revents_ptr = crate::MutPtr::<P, i16>::from_usize(
                 fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
             );
             let revents: u16 = revents.bits().truncate();
@@ -2024,11 +2024,11 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_pselect(
         &self,
         nfds: u32,
-        readfds: Option<MutPtr<usize>>,
-        writefds: Option<MutPtr<usize>>,
-        exceptfds: Option<MutPtr<usize>>,
-        timeout: TimeParam<Platform>,
-        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+        readfds: Option<MutPtr<P, usize>>,
+        writefds: Option<MutPtr<P, usize>>,
+        exceptfds: Option<MutPtr<P, usize>>,
+        timeout: TimeParam<P>,
+        sigsetpack: Option<ConstPtr<P, litebox_common_linux::SigSetPack>>,
     ) -> Result<usize, Errno> {
         if sigsetpack.is_some() {
             unimplemented!("no sigsetpack support yet");
@@ -2097,9 +2097,9 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         target: DupFdRequest,
     ) -> Result<usize, DupFdError> {
-        fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
-            task: &Task<FS>,
-            files: &FilesState<FS>,
+        fn dup<P: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            task: &Task<P, FS>,
+            files: &FilesState<P, FS>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
@@ -2253,12 +2253,12 @@ struct Diroff(usize);
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,
         fd: i32,
-        dirp: MutPtr<u8>,
+        dirp: MutPtr<P, u8>,
         count: usize,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -2299,9 +2299,9 @@ impl<FS: ShimFS> Task<FS> {
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };
-                    let hdr_ptr = crate::MutPtr::from_usize(dirp.as_usize() + nbytes);
+                    let hdr_ptr = crate::MutPtr::<P, _>::from_usize(dirp.as_usize() + nbytes);
                     hdr_ptr.write_at_offset(0, dirent64).ok_or(Errno::EFAULT)?;
-                    let name_ptr = crate::MutPtr::from_usize(
+                    let name_ptr = crate::MutPtr::<P, _>::from_usize(
                         hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
                     );
                     name_ptr
@@ -2349,11 +2349,11 @@ mod tests {
         let second = b"second";
         let iovs = [
             IoWriteVec {
-                iov_base: ConstPtr::from_usize(first.as_ptr().expose_provenance()),
+                iov_base: ConstPtr::<P, _>::from_usize(first.as_ptr().expose_provenance()),
                 iov_len: first.len(),
             },
             IoWriteVec {
-                iov_base: ConstPtr::from_usize(second.as_ptr().expose_provenance()),
+                iov_base: ConstPtr::<P, _>::from_usize(second.as_ptr().expose_provenance()),
                 iov_len: second.len(),
             },
         ];

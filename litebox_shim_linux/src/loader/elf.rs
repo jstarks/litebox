@@ -22,13 +22,13 @@ use super::stack::UserStack;
 use crate::{ShimFS, Task};
 
 // An opened elf file
-struct ElfFile<'a, FS: ShimFS> {
-    task: &'a Task<FS>,
+struct ElfFile<'a, P: crate::ShimPlatform, FS: crate::ShimFS> {
+    task: &'a Task<P, FS>,
     fd: i32,
 }
 
-impl<'a, FS: ShimFS> ElfFile<'a, FS> {
-    fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
+impl<'a, P: crate::ShimPlatform, FS: crate::ShimFS> ElfFile<'a, P, FS> {
+    fn new(task: &'a Task<P, FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
@@ -36,13 +36,13 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
     }
 }
 
-impl<FS: ShimFS> Drop for ElfFile<'_, FS> {
+impl<P: crate::ShimPlatform, FS: crate::ShimFS> Drop for ElfFile<'_, P, FS> {
     fn drop(&mut self) {
         self.task.sys_close(self.fd).expect("failed to close fd");
     }
 }
 
-impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
+impl<P: crate::ShimPlatform, FS: crate::ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, P, FS> {
     type Error = Errno;
 
     fn read_at(&mut self, mut offset: u64, mut buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -68,7 +68,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
     }
 }
 
-impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
+impl<P: crate::ShimPlatform, FS: crate::ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, P, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
@@ -93,11 +93,11 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let mapping_end = mapping_ptr + mapping_len;
         if ptr != mapping_ptr {
             self.task
-                .sys_munmap(MutPtr::from_usize(mapping_ptr), ptr - mapping_ptr)?;
+                .sys_munmap(MutPtr::<P, _>::from_usize(mapping_ptr), ptr - mapping_ptr)?;
         }
         if end != mapping_end {
             self.task
-                .sys_munmap(MutPtr::from_usize(end), mapping_end - end)?;
+                .sys_munmap(MutPtr::<P, _>::from_usize(end), mapping_end - end)?;
         }
         Ok(ptr)
     }
@@ -143,7 +143,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        let addr = crate::MutPtr::<u8>::from_usize(address);
+        let addr = crate::MutPtr::<P, u8>::from_usize(address);
         self.task.sys_mprotect(addr, len, prot.flags())
     }
 }
@@ -156,19 +156,19 @@ pub struct ElfLoadInfo {
 }
 
 /// Loader for ELF files
-pub(crate) struct ElfLoader<'a, FS: ShimFS> {
+pub(crate) struct ElfLoader<'a, P: crate::ShimPlatform, FS: crate::ShimFS> {
     path: &'a str,
-    main: FileAndParsed<'a, FS>,
-    interp: Option<FileAndParsed<'a, FS>>,
+    main: FileAndParsed<'a, P, FS>,
+    interp: Option<FileAndParsed<'a, P, FS>>,
 }
 
-struct FileAndParsed<'a, FS: ShimFS> {
-    file: ElfFile<'a, FS>,
+struct FileAndParsed<'a, P: crate::ShimPlatform, FS: crate::ShimFS> {
+    file: ElfFile<'a, P, FS>,
     parsed: ElfParsedFile,
 }
 
-impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
-    fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, ElfLoaderError> {
+impl<'a, P: crate::ShimPlatform, FS: crate::ShimFS> FileAndParsed<'a, P, FS> {
+    fn new(task: &'a Task<P, FS>, path: impl litebox::path::Arg) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -211,9 +211,9 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
     }
 }
 
-impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
+impl<'a, P: crate::ShimPlatform, FS: crate::ShimFS> ElfLoader<'a, P, FS> {
     /// Parses an ELF file from the given path.
-    pub fn new(task: &'a Task<FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
+    pub fn new(task: &'a Task<P, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
@@ -268,7 +268,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
-        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
+        let mut stack = UserStack::<P>::new(sp, super::DEFAULT_STACK_SIZE)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
             .init(argv, envp, aux)

@@ -52,9 +52,9 @@ use crate::{
 ///
 /// NOTE: The above layout diagram is for 64-bit processes. Similar (but updated to use 32-bit
 /// values, rather than 64-bit values) is used for 32-bit processes.
-pub(super) struct UserStack {
+pub(super) struct UserStack<P: crate::ShimPlatform> {
     /// The top of the stack (base address)
-    stack_top: MutPtr<u8>,
+    stack_top: MutPtr<P, u8>,
     /// The length of the stack
     #[expect(dead_code, reason = "should we remove this?")]
     len: usize,
@@ -62,14 +62,14 @@ pub(super) struct UserStack {
     pos: usize,
 }
 
-impl UserStack {
+impl<P: crate::ShimPlatform> UserStack<P> {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
+    pub(super) fn new(stack_top: MutPtr<P, u8>, len: usize) -> Option<Self> {
         if stack_top.as_usize() % Self::STACK_ALIGNMENT != 0 {
             return None;
         }
@@ -136,7 +136,7 @@ impl UserStack {
         self.push_usize(0)?;
         let size = offsets.len().checked_mul(size_of::<usize>())?;
         self.pos = self.pos.checked_sub(size)?;
-        let ptr: MutPtr<usize> = MutPtr::from_usize(self.stack_top.as_usize() + self.pos);
+        let ptr: MutPtr<P, usize> = MutPtr::<P, _>::from_usize(self.stack_top.as_usize() + self.pos);
         for (i, p) in offsets.iter().enumerate() {
             let addr: usize = self.stack_top.as_usize() + *p;
             ptr.write_at_offset(i.reinterpret_as_signed(), addr)?;

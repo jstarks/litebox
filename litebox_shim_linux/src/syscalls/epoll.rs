@@ -19,16 +19,16 @@ use litebox::{
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
-use litebox_platform_multiplex::Platform;
+
 
 use super::file::FilesState;
-use crate::{GlobalState, ShimFS};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
-pub(crate) struct EpollSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
-impl<FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<FS> {
-    type Entry = EpollFile<FS>;
+pub(crate) struct EpollSubsystem<P: ShimPlatform, FS: ShimFS>(core::marker::PhantomData<(P, FS)>);
+impl<P: ShimPlatform, FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<P, FS> {
+    type Entry = EpollFile<P, FS>;
 }
-impl<FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<FS> {}
+impl<P: ShimPlatform, FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<P, FS> {}
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -41,51 +41,51 @@ bitflags::bitflags! {
     }
 }
 
-pub(crate) enum EpollDescriptor<FS: ShimFS> {
-    Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+pub(crate) enum EpollDescriptor<P: ShimPlatform, FS: ShimFS> {
+    Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<P>>>),
+    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<P, FS>>>),
     File(Arc<crate::FileFd<FS>>),
-    Socket(Arc<super::net::SocketFd>),
-    Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
-    Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
+    Socket(Arc<super::net::SocketFd<P>>),
+    Pipe(Arc<litebox::pipes::PipeFd<P>>),
+    Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<P, FS>>>),
 }
 
-impl<FS: ShimFS> EpollDescriptor<FS> {
-    pub fn try_from(files: &FilesState<FS>, raw_fd: usize) -> Result<Self, Errno> {
+impl<P: ShimPlatform, FS: ShimFS> EpollDescriptor<P, FS> {
+    pub fn try_from(files: &FilesState<P, FS>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
             return Ok(EpollDescriptor::File(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<P>>(raw_fd) {
             return Ok(EpollDescriptor::Socket(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<P>>(raw_fd) {
             return Ok(EpollDescriptor::Pipe(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem<P>>(raw_fd) {
             return Ok(EpollDescriptor::Eventfd(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<P, FS>>(raw_fd) {
             return Ok(EpollDescriptor::Epoll(fd));
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<P, FS>>(raw_fd) {
             return Ok(EpollDescriptor::Unix(fd));
         }
         Err(Errno::EBADF)
     }
 }
 
-enum DescriptorRef<FS: ShimFS> {
-    Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem>>),
-    Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+enum DescriptorRef<P: ShimPlatform, FS: ShimFS> {
+    Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem<P>>>),
+    Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<P, FS>>>),
     File(Weak<crate::FileFd<FS>>),
-    Socket(Weak<super::net::SocketFd>),
-    Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
-    Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
+    Socket(Weak<super::net::SocketFd<P>>),
+    Pipe(Weak<litebox::pipes::PipeFd<P>>),
+    Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<P, FS>>>),
 }
 
-impl<FS: ShimFS> DescriptorRef<FS> {
-    fn from(value: &EpollDescriptor<FS>) -> Self {
+impl<P: ShimPlatform, FS: ShimFS> DescriptorRef<P, FS> {
+    fn from(value: &EpollDescriptor<P, FS>) -> Self {
         match value {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
@@ -96,7 +96,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
         }
     }
 
-    fn upgrade(&self) -> Option<EpollDescriptor<FS>> {
+    fn upgrade(&self) -> Option<EpollDescriptor<P, FS>> {
         match self {
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
@@ -108,12 +108,12 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     }
 }
 
-impl<FS: ShimFS> EpollDescriptor<FS> {
+impl<P: ShimPlatform, FS: ShimFS> EpollDescriptor<P, FS> {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
     fn poll(
         &self,
-        global: &GlobalState<FS>,
+        global: &GlobalState<P, FS>,
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
@@ -152,16 +152,16 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
     }
 }
 
-pub(crate) struct EpollFile<FS: ShimFS> {
+pub(crate) struct EpollFile<P: ShimPlatform, FS: ShimFS> {
     interests: litebox::sync::Mutex<
-        litebox_platform_multiplex::Platform,
-        BTreeMap<EpollEntryKey, alloc::sync::Arc<EpollEntry<FS>>>,
+        P,
+        BTreeMap<EpollEntryKey, alloc::sync::Arc<EpollEntry<P, FS>>>,
     >,
-    ready: Arc<ReadySet<FS>>,
+    ready: Arc<ReadySet<P, FS>>,
     status: core::sync::atomic::AtomicU32,
 }
 
-impl<FS: ShimFS> EpollFile<FS> {
+impl<P: ShimPlatform, FS: ShimFS> EpollFile<P, FS> {
     pub(crate) fn new() -> Self {
         EpollFile {
             interests: litebox::sync::Mutex::new(BTreeMap::new()),
@@ -172,8 +172,8 @@ impl<FS: ShimFS> EpollFile<FS> {
 
     pub(crate) fn wait(
         &self,
-        global: &GlobalState<FS>,
-        cx: &WaitContext<'_, Platform>,
+        global: &GlobalState<P, FS>,
+        cx: &WaitContext<'_, P>,
         maxevents: usize,
     ) -> Result<Vec<EpollEvent>, WaitError> {
         let mut events = Vec::new();
@@ -192,10 +192,10 @@ impl<FS: ShimFS> EpollFile<FS> {
 
     pub(crate) fn epoll_ctl(
         &self,
-        global: &GlobalState<FS>,
+        global: &GlobalState<P, FS>,
         op: EpollOp,
         fd: u32,
-        file: &EpollDescriptor<FS>,
+        file: &EpollDescriptor<P, FS>,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
@@ -216,9 +216,9 @@ impl<FS: ShimFS> EpollFile<FS> {
 
     fn add_interest(
         &self,
-        global: &GlobalState<FS>,
+        global: &GlobalState<P, FS>,
         fd: u32,
-        file: &EpollDescriptor<FS>,
+        file: &EpollDescriptor<P, FS>,
         event: EpollEvent,
     ) -> Result<(), Errno> {
         let mut interests = self.interests.lock();
@@ -253,9 +253,9 @@ impl<FS: ShimFS> EpollFile<FS> {
     #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
-        global: &GlobalState<FS>,
+        global: &GlobalState<P, FS>,
         fd: u32,
-        file: &EpollDescriptor<FS>,
+        file: &EpollDescriptor<P, FS>,
         event: EpollEvent,
     ) -> Result<(), Errno> {
         // EPOLLEXCLUSIVE is not allowed for a EPOLL_CTL_MOD operation
@@ -312,7 +312,7 @@ impl<FS: ShimFS> EpollFile<FS> {
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct EpollEntryKey(u32, usize);
 impl EpollEntryKey {
-    fn new<FS: ShimFS>(fd: u32, desc: &EpollDescriptor<FS>) -> Self {
+    fn new<P: ShimPlatform, FS: ShimFS>(fd: u32, desc: &EpollDescriptor<P, FS>) -> Self {
         let ptr = match desc {
             EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
@@ -325,10 +325,10 @@ impl EpollEntryKey {
     }
 }
 
-struct EpollEntry<FS: ShimFS> {
-    desc: DescriptorRef<FS>,
-    inner: litebox::sync::Mutex<litebox_platform_multiplex::Platform, EpollEntryInner>,
-    ready: Arc<ReadySet<FS>>,
+struct EpollEntry<P: ShimPlatform, FS: ShimFS> {
+    desc: DescriptorRef<P, FS>,
+    inner: litebox::sync::Mutex<P, EpollEntryInner>,
+    ready: Arc<ReadySet<P, FS>>,
     is_ready: AtomicBool,
     is_enabled: AtomicBool,
     weak_self: Weak<Self>,
@@ -340,13 +340,13 @@ struct EpollEntryInner {
     data: u64,
 }
 
-impl<FS: ShimFS> EpollEntry<FS> {
+impl<P: ShimPlatform, FS: ShimFS> EpollEntry<P, FS> {
     fn new(
-        desc: DescriptorRef<FS>,
+        desc: DescriptorRef<P, FS>,
         mask: Events,
         flags: EpollFlags,
         data: u64,
-        ready: Arc<ReadySet<FS>>,
+        ready: Arc<ReadySet<P, FS>>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| EpollEntry {
             desc,
@@ -358,7 +358,7 @@ impl<FS: ShimFS> EpollEntry<FS> {
         })
     }
 
-    fn poll(&self, global: &GlobalState<FS>) -> Option<(Option<EpollEvent>, bool)> {
+    fn poll(&self, global: &GlobalState<P, FS>) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -393,21 +393,21 @@ impl<FS: ShimFS> EpollEntry<FS> {
     }
 }
 
-impl<FS: ShimFS> Observer<Events> for EpollEntry<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Observer<Events> for EpollEntry<P, FS> {
     fn on_events(&self, _events: &Events) {
         self.ready.push(self);
     }
 }
 
-struct ReadySet<FS: ShimFS> {
+struct ReadySet<P: ShimPlatform, FS: ShimFS> {
     entries: litebox::sync::Mutex<
-        litebox_platform_multiplex::Platform,
-        VecDeque<alloc::sync::Weak<EpollEntry<FS>>>,
+        P,
+        VecDeque<alloc::sync::Weak<EpollEntry<P, FS>>>,
     >,
-    pollee: Pollee<Platform>,
+    pollee: Pollee<P>,
 }
 
-impl<FS: ShimFS> ReadySet<FS> {
+impl<P: ShimPlatform, FS: ShimFS> ReadySet<P, FS> {
     fn new() -> Self {
         Self {
             entries: litebox::sync::Mutex::new(VecDeque::new()),
@@ -415,7 +415,7 @@ impl<FS: ShimFS> ReadySet<FS> {
         }
     }
 
-    fn push(&self, entry: &EpollEntry<FS>) {
+    fn push(&self, entry: &EpollEntry<P, FS>) {
         if !entry.is_enabled.load(core::sync::atomic::Ordering::Relaxed) {
             // the entry is disabled
             return;
@@ -434,7 +434,7 @@ impl<FS: ShimFS> ReadySet<FS> {
 
     fn pop_multiple(
         &self,
-        global: &GlobalState<FS>,
+        global: &GlobalState<P, FS>,
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
@@ -486,21 +486,21 @@ impl<FS: ShimFS> ReadySet<FS> {
 
 /// A poll set used for transient polling of a set of files. Designed for use
 /// with the `poll` and `ppoll` syscalls.
-pub(crate) struct PollSet {
-    entries: Vec<PollEntry>,
+pub(crate) struct PollSet<P: ShimPlatform> {
+    entries: Vec<PollEntry<P>>,
 }
 
-struct PollEntry {
+struct PollEntry<P: ShimPlatform> {
     fd: i32,
     mask: Events,
     revents: Events,
-    observer: Option<Arc<PollEntryObserver>>,
+    observer: Option<Arc<PollEntryObserver<P>>>,
 }
 
 #[derive(Clone)]
-struct PollEntryObserver(Waker<Platform>);
+struct PollEntryObserver<P: ShimPlatform>(Waker<P>);
 
-impl PollSet {
+impl<P: ShimPlatform> PollSet<P> {
     /// Returns a new empty `PollSet` with the given interest capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -512,7 +512,7 @@ impl PollSet {
     ///
     /// If fd is negative, it is ignored during polling.
     pub fn add_fd(&mut self, fd: i32, mask: Events) {
-        self.entries.push(PollEntry {
+        self.entries.push(PollEntry::<P> {
             fd,
             mask: mask | Events::ALWAYS_POLLED,
             revents: Events::empty(),
@@ -522,9 +522,9 @@ impl PollSet {
 
     fn scan_once<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<FS>,
-        files: &FilesState<FS>,
-        waker: Option<&Waker<Platform>>,
+        global: &GlobalState<P, FS>,
+        files: &FilesState<P, FS>,
+        waker: Option<&Waker<P>>,
     ) -> bool {
         let mut is_ready = false;
         for entry in &mut self.entries {
@@ -565,16 +565,16 @@ impl PollSet {
     }
 
     /// Scans the poll set for ready fds once.
-    pub fn scan<FS: ShimFS>(&mut self, global: &GlobalState<FS>, files: &FilesState<FS>) {
+    pub fn scan<FS: ShimFS>(&mut self, global: &GlobalState<P, FS>, files: &FilesState<P, FS>) {
         self.scan_once(global, files, None);
     }
 
     /// Waits for any of the fds in the poll set to become ready.
     pub fn wait<FS: ShimFS>(
         &mut self,
-        global: &GlobalState<FS>,
-        cx: &WaitContext<'_, Platform>,
-        files: &FilesState<FS>,
+        global: &GlobalState<P, FS>,
+        cx: &WaitContext<'_, P>,
+        files: &FilesState<P, FS>,
     ) -> Result<(), WaitError> {
         if self.scan_once(global, files, None) {
             return Ok(());
@@ -606,7 +606,7 @@ impl PollSet {
     }
 }
 
-impl Observer<Events> for PollEntryObserver {
+impl<P: ShimPlatform> Observer<Events> for PollEntryObserver<P> {
     fn on_events(&self, _events: &Events) {
         self.0.wake();
     }
@@ -640,7 +640,7 @@ mod test {
             .global
             .litebox
             .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem<P>>(eventfd);
         let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(raw_fd) = files.insert_raw_fd(typed) else {
             unreachable!()
@@ -666,7 +666,7 @@ mod test {
                 let typed = files
                     .raw_descriptor_store
                     .read()
-                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
                     .unwrap();
                 let _ = global
                     .litebox
@@ -736,7 +736,7 @@ mod test {
             .global
             .litebox
             .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+            .insert::<crate::syscalls::eventfd::EventfdSubsystem<P>>(eventfd);
         let no_fds = FilesState::new(task.files.borrow().fs.clone());
         let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
         let Ok(raw_fd) = fds.insert_raw_fd(typed) else {
@@ -759,7 +759,7 @@ mod test {
             let typed = fds
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
                 .unwrap();
             task.global
                 .litebox
@@ -776,7 +776,7 @@ mod test {
             let typed = fds
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
                 .unwrap();
             task.global
                 .litebox
@@ -802,7 +802,7 @@ mod test {
             let typed = fds_for_thread
                 .raw_descriptor_store
                 .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem<P>>(raw_fd)
                 .unwrap();
             let handle = global
                 .litebox

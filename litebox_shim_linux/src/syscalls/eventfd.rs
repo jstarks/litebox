@@ -18,23 +18,23 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
-pub(crate) struct EventfdSubsystem;
-impl FdEnabledSubsystem for EventfdSubsystem {
-    type Entry = EventFile<Platform>;
+
+pub(crate) struct EventfdSubsystem<P: RawSyncPrimitivesProvider + TimeProvider>(core::marker::PhantomData<P>);
+impl<P: RawSyncPrimitivesProvider + TimeProvider> FdEnabledSubsystem for EventfdSubsystem<P> {
+    type Entry = EventFile<P>;
 }
-impl FdEnabledSubsystemEntry for EventFile<Platform> {}
+impl<P: RawSyncPrimitivesProvider + TimeProvider> FdEnabledSubsystemEntry for EventFile<P> {}
 
-pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    counter: litebox::sync::Mutex<Platform, u64>,
+pub(crate) struct EventFile<P: RawSyncPrimitivesProvider + TimeProvider> {
+    counter: litebox::sync::Mutex<P, u64>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
-    pollee: Pollee<Platform>,
+    pollee: Pollee<P>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
+impl<P: RawSyncPrimitivesProvider + TimeProvider> EventFile<P> {
     pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
@@ -61,7 +61,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Ok(res)
     }
 
-    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
+    pub(crate) fn read(&self, cx: &WaitContext<'_, P>) -> Result<u64, Errno> {
         self.pollee
             .wait(
                 cx,
@@ -88,7 +88,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Err(TryOpError::TryAgain)
     }
 
-    pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
+    pub(crate) fn write(&self, cx: &WaitContext<'_, P>, value: u64) -> Result<usize, Errno> {
         self.pollee
             .wait(
                 cx,
@@ -102,7 +102,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
+impl<P: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<P> {
     fn check_io_events(&self) -> Events {
         let counter = self.counter.lock();
         let mut events = Events::empty();
@@ -218,7 +218,7 @@ mod tests {
             }
         });
 
-        let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
+        let read = |eventfd: &super::EventFile<P>,
                     expected_value: u64| {
             loop {
                 match eventfd.read(&WaitState::new(platform()).context()) {

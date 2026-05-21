@@ -3,8 +3,8 @@
 
 //! A shim that provides a Linux-compatible ABI via LiteBox.
 //!
-//! This shim is parametric in the choice of [LiteBox platform](../litebox/platform/index.html),
-//! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
+//! This shim is parametric in the choice of
+//! [LiteBox platform](../litebox/platform/index.html).
 
 #![no_std]
 #![expect(
@@ -31,7 +31,6 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
@@ -50,15 +49,15 @@ mod wait;
 
 use crate::syscalls::file::get_file_descriptor_flags;
 
-pub type DefaultFS = LinuxFS;
+pub type DefaultFS<P> = LinuxFS<P>;
 
-pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
-    Platform,
-    litebox::fs::in_mem::FileSystem<Platform>,
+pub(crate) type LinuxFS<P> = litebox::fs::layered::FileSystem<
+    P,
+    litebox::fs::in_mem::FileSystem<P>,
     litebox::fs::layered::FileSystem<
-        Platform,
-        litebox::fs::devices::FileSystem<Platform>,
-        litebox::fs::tar_ro::FileSystem<Platform>,
+        P,
+        litebox::fs::devices::FileSystem<P>,
+        litebox::fs::tar_ro::FileSystem<P>,
     >,
 >;
 
@@ -68,6 +67,78 @@ pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
+/// A platform suitable for use with the Linux shim.
+///
+/// This is a convenience supertrait combining all the platform traits needed
+/// by the Linux shim.
+pub trait ShimPlatform:
+    litebox::platform::Provider
+    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
+    + litebox::platform::ThreadLocalStorageProvider
+    + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox::platform::StdioProvider
+    + litebox::platform::SystemInfoProvider
+    + litebox::platform::CrngProvider
+    + litebox::platform::DerivedKeyProvider
+    + litebox::sync::RawSyncPrimitivesProvider
+    + core::fmt::Debug
+    + Send
+    + Sync
+    + 'static
+{
+    /// Execute a punchthrough syscall.
+    ///
+    /// This method exists to work around a Rust GAT limitation where the
+    /// relationship between `PunchthroughToken<'a>::Punchthrough` and
+    /// `PunchthroughSyscall<'a, Self>` cannot be expressed as a generic bound.
+    fn do_punchthrough(
+        &self,
+        syscall: litebox_common_linux::PunchthroughSyscall<'static, Self>,
+    ) -> Result<usize, litebox_common_linux::errno::Errno>
+    where
+        Self: Sized;
+}
+
+impl<T> ShimPlatform for T where
+    T: litebox::platform::Provider
+        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
+        + litebox::platform::ThreadLocalStorageProvider
+        + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox::platform::StdioProvider
+        + litebox::platform::SystemInfoProvider
+        + litebox::platform::CrngProvider
+        + litebox::platform::DerivedKeyProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    <T as litebox::platform::PunchthroughProvider>::PunchthroughToken<'static>:
+        litebox::platform::PunchthroughToken<
+            Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, T>,
+        >,
+{
+    fn do_punchthrough(
+        &self,
+        syscall: litebox_common_linux::PunchthroughSyscall<'static, Self>,
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        use litebox::platform::{PunchthroughError, PunchthroughProvider as _, PunchthroughToken as _};
+        let token = self
+            .get_punchthrough_token_for(syscall)
+            .expect("Failed to get punchthrough token");
+        token.execute().map_err(|e| match e {
+            PunchthroughError::Failure(errno) => errno,
+            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
+        })
+    }
+}
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     if cfg!(debug_assertions) {
@@ -75,14 +146,14 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
-pub struct LinuxShimEntrypoints<FS: ShimFS> {
-    task: Task<FS>,
+pub struct LinuxShimEntrypoints<P: ShimPlatform, FS: ShimFS> {
+    task: Task<P, FS>,
     // The task should not be moved once it's bound to a platform thread so that
     // we preserve the ability to use TLS in the future.
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
-impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
+impl<P: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<P, FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -120,12 +191,12 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     }
 }
 
-impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
+impl<P: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<P, FS> {
     fn enter_shim(
         &self,
         is_init: bool,
         ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task<FS>, &mut litebox_common_linux::PtRegs),
+        f: impl FnOnce(&Task<P, FS>, &mut litebox_common_linux::PtRegs),
     ) -> ContinueOperation {
         if !is_init {
             self.task.enter_from_guest();
@@ -140,21 +211,14 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 }
 
 /// The shim entry point structure.
-pub struct LinuxShimBuilder {
-    platform: &'static Platform,
-    litebox: LiteBox<Platform>,
+pub struct LinuxShimBuilder<P: ShimPlatform> {
+    platform: &'static P,
+    litebox: LiteBox<P>,
 }
 
-impl Default for LinuxShimBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LinuxShimBuilder {
+impl<P: ShimPlatform> LinuxShimBuilder<P> {
     /// Returns a new shim builder.
-    pub fn new() -> Self {
-        let platform = litebox_platform_multiplex::platform();
+    pub fn new(platform: &'static P) -> Self {
         Self {
             platform,
             litebox: LiteBox::new(platform),
@@ -162,21 +226,21 @@ impl LinuxShimBuilder {
     }
 
     /// Returns the litebox object for the shim.
-    pub fn litebox(&self) -> &LiteBox<Platform> {
+    pub fn litebox(&self) -> &LiteBox<P> {
         &self.litebox
     }
 
     /// Create a default layered file system with the given in-memory and tar read-only layers.
     pub fn default_fs(
         &self,
-        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
-    ) -> DefaultFS {
+        in_mem_fs: litebox::fs::in_mem::FileSystem<P>,
+        tar_ro_fs: litebox::fs::tar_ro::FileSystem<P>,
+    ) -> DefaultFS<P> {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
     /// Build the shim.
-    pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
+    pub fn build<FS: ShimFS>(self) -> LinuxShim<P, FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
@@ -195,14 +259,14 @@ impl LinuxShimBuilder {
     }
 }
 
-pub struct LinuxShim<FS: ShimFS>(Arc<GlobalState<FS>>);
-impl<FS: ShimFS> Clone for LinuxShim<FS> {
+pub struct LinuxShim<P: ShimPlatform, FS: ShimFS>(Arc<GlobalState<P, FS>>);
+impl<P: ShimPlatform, FS: ShimFS> Clone for LinuxShim<P, FS> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<FS: ShimFS> LinuxShim<FS> {
+impl<P: ShimPlatform, FS: ShimFS> LinuxShim<P, FS> {
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
@@ -212,7 +276,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<FS>, loader::elf::ElfLoaderError> {
+    ) -> Result<LoadedProgram<P, FS>, loader::elf::ElfLoaderError> {
         let litebox_common_linux::TaskParams {
             pid,
             ppid,
@@ -268,7 +332,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     }
 
     /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+    pub fn page_manager(&self) -> &PageManager<P, PAGE_SIZE> {
         &self.0.pm
     }
 
@@ -288,26 +352,26 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn tcp_connection(
         &self,
         addr: core::net::SocketAddr,
-    ) -> Result<transport::ShimTransport, Errno> {
+    ) -> Result<transport::ShimTransport<P>, Errno> {
         transport::ShimTransport::connect(self.0.clone(), addr)
     }
 
-    pub fn litebox(&self) -> &LiteBox<Platform> {
+    pub fn litebox(&self) -> &LiteBox<P> {
         &self.0.litebox
     }
 }
 
-pub struct LoadedProgram<FS: ShimFS> {
-    pub entrypoints: LinuxShimEntrypoints<FS>,
-    pub process: LinuxShimProcess,
+pub struct LoadedProgram<P: ShimPlatform, FS: ShimFS> {
+    pub entrypoints: LinuxShimEntrypoints<P, FS>,
+    pub process: LinuxShimProcess<P>,
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit.
-pub struct LinuxShimProcess(Arc<syscalls::process::Process>);
+pub struct LinuxShimProcess<P: ShimPlatform>(Arc<syscalls::process::Process<P>>);
 
-impl LinuxShimProcess {
+impl<P: ShimPlatform> LinuxShimProcess<P> {
     /// Wait for the process to exit, returning its exit code.
     pub fn wait(&self) -> i32 {
         match self.0.wait_for_exit() {
@@ -319,11 +383,11 @@ impl LinuxShimProcess {
 }
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.
-fn default_fs(
-    litebox: &LiteBox<Platform>,
-    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-    tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
-) -> LinuxFS {
+fn default_fs<P: ShimPlatform>(
+    litebox: &LiteBox<P>,
+    in_mem_fs: litebox::fs::in_mem::FileSystem<P>,
+    tar_ro_fs: litebox::fs::tar_ro::FileSystem<P>,
+) -> LinuxFS<P> {
     let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
     litebox::fs::layered::FileSystem::new(
         litebox,
@@ -346,8 +410,8 @@ pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
-impl<FS: ShimFS> syscalls::file::FilesState<FS> {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
+impl<P: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<P, FS> {
+    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<P, FS>) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
@@ -375,10 +439,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
 }
 
 // Convenience type aliases
-type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+type ConstPtr<P, T> = <P as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+type MutPtr<P, T> = <P as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
         let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
@@ -392,17 +456,17 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+impl<P: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<P, FS> {
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
         fs: impl FnOnce(&TypedFd<FS>) -> R,
-        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
-        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
-        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
-        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
-        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
+        net: impl FnOnce(&TypedFd<Network<P>>) -> R,
+        pipes: impl FnOnce(&TypedFd<Pipes<P>>) -> R,
+        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<P>>) -> R,
+        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<P, FS>>) -> R,
+        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<P, FS>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -459,12 +523,12 @@ impl ToSyscallResult for Result<u32, Errno> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
         &self,
         fd: i32,
-        buf: MutPtr<u8>,
+        buf: MutPtr<P, u8>,
         count: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
@@ -517,7 +581,7 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
         let request =
-            SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+            SyscallRequest::<P>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -1004,34 +1068,34 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 /// Global shim state, shared across all tasks.
-struct GlobalState<FS: ShimFS> {
+struct GlobalState<P: ShimPlatform, FS: ShimFS> {
     /// The platform instance used throughout the shim.
-    platform: &'static Platform,
+    platform: &'static P,
     /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
+    litebox: litebox::LiteBox<P>,
     /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    pm: litebox::mm::PageManager<P, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
-    futex_manager: FutexManager<Platform>,
+    futex_manager: FutexManager<P>,
     /// The anonymous pipe implementation.
-    pipes: Pipes<Platform>,
+    pipes: Pipes<P>,
     /// The network subsystem.
-    net: litebox::sync::Mutex<Platform, Network<Platform>>,
+    net: litebox::sync::Mutex<P, Network<P>>,
     /// The time when the shim was started.
-    boot_time: <Platform as TimeProvider>::Instant,
+    boot_time: <P as TimeProvider>::Instant,
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
-    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
+    unix_addr_table: litebox::sync::RwLock<P, syscalls::unix::UnixAddrTable<P, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    elf_patch_cache: litebox::sync::Mutex<P, syscalls::mm::ElfPatchCache>,
 }
 
-struct Task<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
-    wait_state: wait::WaitState,
-    thread: syscalls::process::ThreadState,
+struct Task<P: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<P, FS>>,
+    wait_state: wait::WaitState<P>,
+    thread: syscalls::process::ThreadState<P>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1044,14 +1108,14 @@ struct Task<FS: ShimFS> {
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
-    fs: RefCell<Arc<syscalls::file::FsState>>,
+    fs: RefCell<Arc<syscalls::file::FsState<P>>>,
     /// File descriptors. `RefCell` to support `unshare` in the future.
-    files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
+    files: RefCell<Arc<syscalls::file::FilesState<P, FS>>>,
     /// Signal state
-    signals: syscalls::signal::SignalState,
+    signals: syscalls::signal::SignalState<P>,
 }
 
-impl<FS: ShimFS> Drop for Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Drop for Task<P, FS> {
     fn drop(&mut self) {
         self.prepare_for_exit();
     }
@@ -1062,9 +1126,9 @@ mod test_utils {
     extern crate std;
     use super::*;
 
-    impl<FS: ShimFS> GlobalState<FS> {
+    impl<P: ShimPlatform, FS: ShimFS> GlobalState<P, FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>, fs: alloc::sync::Arc<FS>) -> Task<FS> {
+        pub(crate) fn new_test_task(self: Arc<Self>, fs: alloc::sync::Arc<FS>) -> Task<P, FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1091,7 +1155,7 @@ mod test_utils {
         }
     }
 
-    impl<FS: ShimFS> Task<FS> {
+    impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let tid = self
@@ -1120,7 +1184,7 @@ mod test_utils {
         /// Panics if the test process is already terminating.
         pub(crate) fn spawn_clone_for_test<R>(
             &self,
-            f: impl 'static + Send + FnOnce(Task<FS>) -> R,
+            f: impl 'static + Send + FnOnce(Task<P, FS>) -> R,
         ) -> std::thread::JoinHandle<R>
         where
             R: 'static + Send,

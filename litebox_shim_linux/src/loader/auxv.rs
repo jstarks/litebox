@@ -67,7 +67,7 @@ pub enum AuxKey {
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: crate::ShimPlatform, FS: crate::ShimFS> Task<P, FS> {
     /// Initialize the auxiliary vector with user information and VDSO address.
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();

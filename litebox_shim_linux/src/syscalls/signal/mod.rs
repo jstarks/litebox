@@ -12,7 +12,7 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -27,24 +27,24 @@ use litebox_common_linux::signal::{
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
-pub(crate) struct SignalState {
+
+pub(crate) struct SignalState<P: ShimPlatform> {
     /// Pending thread signals.
     pending: RefCell<PendingSignals>,
     /// Pending process signals (shared across all threads).
-    shared_pending: Arc<Mutex<Platform, PendingSignals>>,
+    shared_pending: Arc<Mutex<P, PendingSignals>>,
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
-    handlers: RefCell<Arc<SignalHandlers>>,
+    handlers: RefCell<Arc<SignalHandlers<P>>>,
     /// Alternate signal stack.
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
 }
 
-impl SignalState {
+impl<P: ShimPlatform> SignalState<P> {
     pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
@@ -115,8 +115,8 @@ impl SignalState {
     }
 }
 
-struct SignalHandlers {
-    inner: Mutex<Platform, SignalHandlersInner>,
+struct SignalHandlers<P: ShimPlatform> {
+    inner: Mutex<P, SignalHandlersInner>,
 }
 
 #[derive(Clone)]
@@ -152,7 +152,7 @@ struct Handler {
     immutable: bool,
 }
 
-impl SignalHandlers {
+impl<P: ShimPlatform> SignalHandlers<P> {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SignalHandlersInner {
@@ -173,7 +173,7 @@ impl SignalHandlers {
     }
 }
 
-impl Clone for SignalHandlers {
+impl<P: ShimPlatform> Clone for SignalHandlers<P> {
     fn clone(&self) -> Self {
         Self {
             inner: Mutex::new(self.inner.lock().clone()),
@@ -293,7 +293,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
-impl SignalState {
+impl<P: ShimPlatform> SignalState<P> {
     /// Updates the blocked signal mask.
     fn set_signal_mask(&self, mask: SigSet) {
         self.blocked.set(mask);
@@ -380,12 +380,12 @@ impl SignalState {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,
-        set_ptr: Option<crate::ConstPtr<SigSet>>,
-        oldset_ptr: Option<crate::MutPtr<SigSet>>,
+        set_ptr: Option<crate::ConstPtr<P, SigSet>>,
+        oldset_ptr: Option<crate::MutPtr<P, SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigsetsize != core::mem::size_of::<SigSet>() {
@@ -423,8 +423,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_sigaltstack(
         &self,
-        ss_ptr: Option<ConstPtr<SigAltStack>>,
-        old_ss_ptr: Option<MutPtr<SigAltStack>>,
+        ss_ptr: Option<ConstPtr<P, SigAltStack>>,
+        old_ss_ptr: Option<MutPtr<P, SigAltStack>>,
         ctx: &PtRegs,
     ) -> Result<usize, Errno> {
         let mut old_ss = self.signals.altstack.get();
@@ -447,7 +447,7 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
-        let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
+        let uctx_ptr = ConstPtr::<P, Ucontext>::from_usize(uctx_addr);
         let Some(uctx) = uctx_ptr.read_at_offset(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
@@ -464,8 +464,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rt_sigaction(
         &self,
         signal: Signal,
-        act_ptr: Option<ConstPtr<SigAction>>,
-        oldact_ptr: Option<MutPtr<SigAction>>,
+        act_ptr: Option<ConstPtr<P, SigAction>>,
+        oldact_ptr: Option<MutPtr<P, SigAction>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {

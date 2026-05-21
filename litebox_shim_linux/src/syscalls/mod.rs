@@ -43,9 +43,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Helper function to write a value of type T to user memory.
 /// If the buffer size (i.e., provided `len`) is smaller than `size_of::<T>()`, only write up to `len` bytes.
-fn write_to_user<T: FromBytes + IntoBytes + Immutable>(
+fn write_to_user<P: crate::ShimPlatform, T: FromBytes + IntoBytes + Immutable>(
     val: T,
-    optval: crate::MutPtr<u8>,
+    optval: crate::MutPtr<P, u8>,
     len: u32,
 ) -> Result<usize, litebox_common_linux::errno::Errno> {
     use litebox::platform::RawMutPointer as _;
@@ -58,15 +58,15 @@ fn write_to_user<T: FromBytes + IntoBytes + Immutable>(
 }
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
-fn read_from_user<T: FromBytes>(
-    optval: crate::ConstPtr<u8>,
+fn read_from_user<P: crate::ShimPlatform, T: FromBytes>(
+    optval: crate::ConstPtr<P, u8>,
     optlen: usize,
 ) -> Result<T, litebox_common_linux::errno::Errno> {
     use litebox::platform::RawConstPointer as _;
     if optlen < size_of::<T>() {
         return Err(litebox_common_linux::errno::Errno::EINVAL);
     }
-    let optval: crate::ConstPtr<T> = crate::ConstPtr::from_usize(optval.as_usize());
+    let optval: crate::ConstPtr<P, T> = crate::ConstPtr::<P, _>::from_usize(optval.as_usize());
     optval
         .read_at_offset(0)
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)

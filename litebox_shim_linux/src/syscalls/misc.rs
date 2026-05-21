@@ -5,18 +5,18 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-use crate::{ShimFS, Task};
+use crate::{ShimFS, ShimPlatform, Task};
 use litebox::{
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::errno::Errno;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `getrandom`.
     pub(crate) fn sys_getrandom(
         &self,
-        buf: crate::MutPtr<u8>,
+        buf: crate::MutPtr<P, u8>,
         count: usize,
         _flags: litebox_common_linux::RngFlags,
     ) -> Result<usize, Errno> {
@@ -65,11 +65,11 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `uname`.
     pub(crate) fn sys_uname(
         &self,
-        buf: crate::MutPtr<litebox_common_linux::Utsname>,
+        buf: crate::MutPtr<P, litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
         buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
     }
@@ -104,14 +104,14 @@ const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
 const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
-impl<FS: ShimFS> Task<FS> {
+impl<P: ShimPlatform, FS: ShimFS> Task<P, FS> {
     /// Handle syscall `capget`.
     ///
     /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
     pub(crate) fn sys_capget(
         &self,
-        header: crate::MutPtr<litebox_common_linux::CapHeader>,
-        data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
+        header: crate::MutPtr<P, litebox_common_linux::CapHeader>,
+        data: Option<crate::MutPtr<P, litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
         let hdr = header.read_at_offset(0).ok_or(Errno::EFAULT)?;
         match hdr.version {

@@ -12,7 +12,7 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, Platform, ShimFS};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -23,12 +23,12 @@ trait DropGuard: Send + Sync {
 }
 
 /// Concrete, generic implementation of [`DropGuard`].
-struct SocketDropGuard<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
-    sockfd: SocketFd,
+struct SocketDropGuard<P: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<P, FS>>,
+    sockfd: SocketFd<P>,
 }
 
-impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
+impl<P: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<P, FS> {
     fn close(&mut self) {
         let _ = self
             .global
@@ -38,7 +38,7 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     }
 }
 
-/// A spin-polling TCP transport backed by a raw `SocketFd` and its [`NetworkProxy`].
+/// A spin-polling TCP transport backed by a raw `SocketFd<P>` and its [`NetworkProxy`].
 ///
 /// The socket lives in the litebox descriptor table (for metadata / proxy) but is
 /// **not** registered in the guest's file-descriptor table, keeping it invisible
@@ -48,12 +48,12 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
 /// (`try_read` / `try_write`), with spin-polling when data is not yet available.
 /// This avoids the need for a `WaitState` or any association with a particular
 /// guest `Task`.
-pub struct ShimTransport {
+pub struct ShimTransport<P: ShimPlatform> {
     drop_guard: Box<dyn DropGuard>,
-    proxy: Arc<NetworkProxy<Platform>>,
+    proxy: Arc<NetworkProxy<P>>,
 }
 
-impl ShimTransport {
+impl<P: ShimPlatform> ShimTransport<P> {
     /// Create a TCP socket, connect it to `addr`, and return a transport.
     ///
     /// The socket is created via [`litebox::net::Network::socket`] and initialised
@@ -63,7 +63,7 @@ impl ShimTransport {
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
-        global: Arc<GlobalState<FS>>,
+        global: Arc<GlobalState<P, FS>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
@@ -95,13 +95,13 @@ impl ShimTransport {
     }
 }
 
-impl Drop for ShimTransport {
+impl<P: ShimPlatform> Drop for ShimTransport<P> {
     fn drop(&mut self) {
         self.drop_guard.close();
     }
 }
 
-impl transport::Read for ShimTransport {
+impl<P: ShimPlatform> transport::Read for ShimTransport<P> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         loop {
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
@@ -116,7 +116,7 @@ impl transport::Read for ShimTransport {
     }
 }
 
-impl transport::Write for ShimTransport {
+impl<P: ShimPlatform> transport::Write for ShimTransport<P> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         loop {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
@@ -258,9 +258,9 @@ mod tests {
     }
 
     fn connect_9p(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<crate::test_utils::TestPlatform, crate::DefaultFS<crate::test_utils::TestPlatform>>,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
+    ) -> nine_p::FileSystem<crate::test_utils::TestPlatform, ShimTransport<crate::test_utils::TestPlatform>> {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");

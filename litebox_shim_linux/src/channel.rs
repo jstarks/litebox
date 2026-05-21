@@ -60,12 +60,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
     }
 }
 
-pub(crate) struct ReadEnd<T> {
-    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
-    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
+pub(crate) struct ReadEnd<P: RawSyncPrimitivesProvider + TimeProvider, T> {
+    endpoint: alloc::sync::Arc<EndPointer<P, ringbuf::HeapCons<T>>>,
+    peer: alloc::sync::Weak<EndPointer<P, ringbuf::HeapProd<T>>>,
 }
 
-impl<T> ReadEnd<T> {
+impl<P: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<P, T> {
     fn update_pollee(&self) {
         if let Some(peer) = self.peer.upgrade() {
             peer.pollee.notify_observers(litebox::event::Events::OUT);
@@ -113,13 +113,21 @@ impl<T> ReadEnd<T> {
     common_functions_for_channel!();
 }
 
-#[derive(Clone)]
-pub(crate) struct WriteEnd<T> {
-    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
-    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+pub(crate) struct WriteEnd<P: RawSyncPrimitivesProvider + TimeProvider, T> {
+    endpoint: alloc::sync::Arc<EndPointer<P, ringbuf::HeapProd<T>>>,
+    peer: alloc::sync::Weak<EndPointer<P, ringbuf::HeapCons<T>>>,
 }
 
-impl<T> WriteEnd<T> {
+impl<P: RawSyncPrimitivesProvider + TimeProvider, T> Clone for WriteEnd<P, T> {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            peer: self.peer.clone(),
+        }
+    }
+}
+
+impl<P: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<P, T> {
     pub(crate) fn try_write_one(&self, elem: T) -> Result<(), (T, Errno)> {
         if self.is_shutdown() || self.is_peer_shutdown() {
             return Err((elem, Errno::EPIPE));
@@ -141,7 +149,7 @@ impl<T> WriteEnd<T> {
         self.endpoint.rb.lock().is_full()
     }
 
-    pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
+    pub(crate) fn is_pair(&self, reader: &ReadEnd<P, T>) -> bool {
         if let Some(peer) = self.peer.upgrade() {
             Arc::ptr_eq(&peer, &reader.endpoint)
         } else {
@@ -156,16 +164,16 @@ impl<T> WriteEnd<T> {
     common_functions_for_channel!();
 }
 
-pub(crate) struct Channel<T> {
-    writer: WriteEnd<T>,
-    reader: ReadEnd<T>,
+pub(crate) struct Channel<P: RawSyncPrimitivesProvider + TimeProvider, T> {
+    writer: WriteEnd<P, T>,
+    reader: ReadEnd<P, T>,
 }
 
-impl<T> Channel<T> {
+impl<P: RawSyncPrimitivesProvider + TimeProvider, T> Channel<P, T> {
     pub(crate) fn new(
         capacity: usize,
-        writer_pollee: Arc<Pollee<crate::Platform>>,
-        reader_pollee: Arc<Pollee<crate::Platform>>,
+        writer_pollee: Arc<Pollee<P>>,
+        reader_pollee: Arc<Pollee<P>>,
     ) -> Self {
         use ringbuf::traits::Split as _;
         let rb: ringbuf::HeapRb<T> = ringbuf::HeapRb::new(capacity);
@@ -187,7 +195,7 @@ impl<T> Channel<T> {
     }
 
     /// Turn the channel into a pair of its read and write ends.
-    pub(crate) fn split(self) -> (WriteEnd<T>, ReadEnd<T>) {
+    pub(crate) fn split(self) -> (WriteEnd<P, T>, ReadEnd<P, T>) {
         let Channel { writer, reader } = self;
         (writer, reader)
     }

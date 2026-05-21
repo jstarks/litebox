@@ -4,7 +4,7 @@
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
+use litebox_platform_multiplex::set_platform;
 use zerocopy::FromBytes as _;
 
 use crate::MutPtr;
@@ -626,7 +626,7 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
     // exact interleaving, since we rely on sleep-based synchronization.
     for _ in 0..200 {
         let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
-            litebox_platform_multiplex::Platform,
+            P,
             u32,
         >::new(0));
         // Step 1: W1 acquires the write lock on the main thread.
